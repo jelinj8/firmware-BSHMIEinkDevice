@@ -1,0 +1,38 @@
+# STUB - not functional yet. `runs-on: platformio` targets a Forgejo runner label/builder image
+# that does not exist anywhere in this infrastructure today (confirmed: only `docker` and
+# `maven-jdk` runner images currently exist, across every Bliksoft-public/SYS repo checked). This
+# file is deliberately checked in ready-to-go so wiring it up later is just infra work, not a
+# firmware-repo change.
+#
+# To make this real:
+#   1. Build a new builder image repo under the `_forgejo`/SYS org, mirroring
+#      `_forgejo/runner-maven-jdk`'s proven pattern exactly: its own Dockerfile (PlatformIO +
+#      Python + a Node 20 base, since Forgejo Actions runs JS actions like `actions/checkout` via
+#      node inside the job container - see `runner-dind-base/README.md`), a `workflow_dispatch`-only
+#      `build.yml` (a base image shouldn't rebuild just because a README changed), date-tagged +
+#      floating `latest`, pushed to e.g. `forgejo.bliksoft.cz/sys/runner-platformio-esp32`.
+#   2. Edit `talos-minipc/k8s_forgejo/04-runner-config-configmap.yaml` to map a `platformio` runner
+#      label to that image, `kubectl apply` it, then `kubectl rollout restart
+#      deployment/forgejo-runner -n forgejo-runner` - rebuilding the image alone does nothing until
+#      this step also happens (this exact gotcha already bit `StorageManagerServer`'s pipeline once).
+#      That cluster-config repo isn't checked out on the machine this stub was written on, so this
+#      step couldn't be done as part of adding this file.
+#
+# Once the label exists, this workflow needs no further changes - the steps below already mirror
+# .github/workflows/firmware-build.yml's own build step.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: platformio
+    steps:
+      - name: Clone repository
+        run: |
+          git clone --depth 1 --branch "${{ github.ref_name }}" \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@${{ vars.REGISTRY_URL }}/${{ github.repository }}.git" src
+
+      - name: Build firmware (esp32-s3-crowpanel)
+        working-directory: src
+        run: pio run -e esp32-s3-crowpanel

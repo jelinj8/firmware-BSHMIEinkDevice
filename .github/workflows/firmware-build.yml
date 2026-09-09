@@ -1,0 +1,55 @@
+# Builds the firmware on every push/PR (verification only), and additionally attaches the built
+# firmware.bin/firmware.elf to a GitHub Release as release assets when one is published.
+#
+# No PlatformIO GitHub Action has been used/vetted anywhere in this project's infrastructure before
+# this workflow - a plain `pip install platformio && pio run` is used instead of the official
+# `platformio/platformio-github-action`, deliberately, to avoid depending on a third-party action
+# whose maintenance status wasn't checked before adopting it. Revisit if that trade-off turns out
+# wrong in practice.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+          key: platformio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build firmware (esp32-s3-crowpanel)
+        run: pio run -e esp32-s3-crowpanel
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-esp32-s3-crowpanel
+          path: |
+            .pio/build/esp32-s3-crowpanel/firmware.bin
+            .pio/build/esp32-s3-crowpanel/firmware.elf
+
+      - name: Attach firmware to the published release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            .pio/build/esp32-s3-crowpanel/firmware.bin
+            .pio/build/esp32-s3-crowpanel/firmware.elf
