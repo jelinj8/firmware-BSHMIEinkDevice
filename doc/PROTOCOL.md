@@ -3545,6 +3545,46 @@ if they turn out to matter in practice:
     three pre-existing ones) at native resolution; sample sentences ("À bientôt, été!", "schön,
     über", "mañana está", "Camões é ótimo", "vŕba, ľúbim", "ćma, źle, śpi") all read correctly.
 
+99. **Design note 76's "BLE undiscoverable" issue is resolved — it was never a hardware/RF/NimBLE-
+    internal problem, just a missing advertised name.** Root cause, found by reading
+    `setupBle()` (`src/main.cpp`) against the vendored NimBLE-Arduino 2.5.1 source
+    (`NimBLEAdvertising.cpp`) side by side: the firmware called `addServiceUUID()` and `start()`
+    but never `setName()`, and `NimBLEAdvertising` defaults `m_scanResp=false` — so scan response was
+    never even sent (`start()` only sends it `if (m_scanResp && m_scanData has content)`), and no
+    name was broadcast anywhere, in either the primary packet or a scan response. Devices advertising
+    only flags + a bare 128-bit service UUID with zero name are exactly the ones many scanners/OS
+    pairing UIs are least likely to surface prominently, which reads as "undiscoverable" without
+    actually being an RF/hardware fault — consistent with note 76's own observation that
+    `BLE_ADDRESS` came back correct (the controller was fine all along).
+    Fix: `setupBle()` now calls `advertising->enableScanResponse(true)` then
+    `advertising->setName(deviceName())` before `start()`. Deliberately *not* put in the primary
+    packet instead: that packet is already tight (flags + the custom 128-bit service UUID = 21 of
+    the legacy 31-byte budget), leaving only ~8 bytes for a name inline — not enough for
+    `deviceName()`'s typical length (e.g. `"CrowPanel-3851DC"`) or a longer user-set
+    `SET_DEVICE_NAME` override, so the scan response (its own full 31-byte budget) is the correct
+    home for it, not a workaround.
+    **Verified on real hardware**: flashed, then confirmed the device shows up with its name
+    (`"CrowPanel-3851DC"`) in nRF Connect on Android and via `bluetoothctl scan on` on Linux/BlueZ.
+    Also newly verified while re-testing this — not just handshake this time, but a full local
+    drawing round trip: `pc-java-lib`'s `DrawPrimitivesBleManualCheck` (new manual check, mirroring
+    the existing Serial-only `DrawPrimitivesManualCheck`) ran end-to-end over BLE — `DRAW_RECT`
+    (REPLACE and XOR), `DRAW_CIRCLE` (outline and filled), `DRAW_LINE`, and a final `REFRESH` — all
+    ACKed and confirmed rendered correctly on the panel. This is the first time any local drawing
+    primitive (§12), not just the handshake, was exercised over BLE specifically.
+    One dead end worth recording so it isn't re-walked: this same verification pass hit a *second*,
+    unrelated problem that looked identical from the outside — a from-Windows scan (via
+    `BSToolbox-BLE`'s Rust `ble-bridge` sidecar) found nothing, with or without a service-UUID
+    filter. Bypassing every layer of this project's own code and querying Windows'
+    `BluetoothLEAdvertisementWatcher` WinRT API directly (PowerShell, no Java/Rust involved)
+    reproduced the same zero-results outcome for *every* BLE peripheral, not just this device
+    (already-bonded phone/earbuds included) — proving the PC's own Bluetooth stack was wedged, not a
+    regression in this project's BLE code, `pc-java-lib`, or `BSToolbox-BLE`. A Bluetooth radio
+    toggle didn't clear it (a full reboot was the next step, not yet tried). The actual verification
+    above was done instead from a second machine (Linux/aarch64, BlueZ 5.82) reachable over the LAN,
+    which saw the device immediately via plain `bluetoothctl scan on` — a useful fallback to remember
+    for future BLE-transport verification if the usual Windows dev machine's BLE stack is ever
+    wedged again like this.
+
 ## 22. Implementation status
 
 - **`pc-java-lib/`** — **BSHMIProtocol** (`cz.bliksoft.hmieink:bshmiprotocol`, package
@@ -4271,6 +4311,22 @@ if they turn out to matter in practice:
   **not locally rebuilt/verified** — that project's binary rebuild goes through its own GitHub CI
   pipeline, no local Rust toolchain was available in this session) so this same trap is
   documented/harder to hit for future consumers of that library.
+
+  **Design note 76's "BLE undiscoverable" issue is fixed (design note 99)**: root cause was
+  `setupBle()` never calling `NimBLEAdvertising::setName()` — no scan response was ever sent (NimBLE
+  defaults `m_scanResp=false`) and no name was broadcast anywhere, which is what made the device
+  read as unreliably-discoverable rather than any RF/hardware/NimBLE-internal fault as note 76 had
+  guessed. Fixed by enabling scan response and setting the name there (the primary advertising
+  packet is already near its 31-byte budget with flags + the custom 128-bit service UUID, leaving no
+  room for a name of realistic length). **Verified on real hardware**: the device now shows up named
+  in nRF Connect (Android) and `bluetoothctl scan` (Linux/BlueZ). Also used this as the opportunity
+  to close a real gap: `DrawPrimitivesManualCheck` (above) had only ever been run over Serial —
+  `pc-java-lib` gained a new `DrawPrimitivesBleManualCheck` mirroring it exactly, and a real
+  `DRAW_RECT`/`DRAW_CIRCLE`/`DRAW_LINE`/`REFRESH` sequence now round-trips correctly over BLE too,
+  ACKed and confirmed rendered on the panel — the first time a local drawing primitive, not just the
+  handshake, was exercised over that transport. Also see design note 99 for a Windows-Bluetooth-
+  stack red herring hit mid-verification (unrelated to this project's code) and its workaround
+  (verify from a Linux/BlueZ machine instead).
 
 See the repository root `CLAUDE.md` for the project brief and hardware specs, and the plan file
 this design originated from for the full rationale behind each decision.

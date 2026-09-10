@@ -524,6 +524,13 @@ void setupBle() {
 
 	NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
 	advertising->addServiceUUID(ble::kServiceUuid);
+	// Primary advertising packet is already tight (flags + this 128-bit service UUID is 21 of the
+	// 31 legacy bytes), so the name goes in the scan response instead of the primary packet -
+	// NimBLEAdvertising::setName() routes there automatically once scan response is enabled (see
+	// NimBLEAdvertising.cpp). Without this, no name is broadcast anywhere, which is why scanners
+	// were showing the device unnamed/hard to pick out.
+	advertising->enableScanResponse(true);
+	advertising->setName(deviceName());
 	if (gBleEnabled) {
 		bool advOk = advertising->start();
 		Serial.printf("BLE: advertising->start() -> %s\n", advOk ? "true" : "FALSE");
