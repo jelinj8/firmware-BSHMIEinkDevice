@@ -606,6 +606,7 @@ constexpr uint32_t kFeatureDrawingPrimitives = 1u << 3;
 constexpr uint32_t kFeatureSdCardSlot = 1u << 5;	  // capability, not live presence - see STORAGE_INFO
 constexpr uint32_t kFeatureInternalStorage = 1u << 6;
 constexpr uint32_t kFeatureGpio = 1u << 7;
+constexpr uint32_t kFeatureInlineImageDraw = 1u << 9;	 // DRAW_IMAGE_DATA (0x0310)
 
 // doc/PROTOCOL.md §17.2: computed once in setup() (see computeBootWakeReason()) and updated again
 // after every LOW_POWER light-sleep resume (execution continues in the same handleSetPowerMode()
@@ -623,8 +624,8 @@ std::vector<uint8_t> buildHandshakeResponsePayload(uint8_t activeTransportValue,
 	// on TCP/Serial, included regardless since it's cheap and harmless there.
 	appendTlvU16LE(tlv, kTlvMaxChunkSize, static_cast<uint16_t>(NimBLEDevice::getMTU() - 3));
 	// bit4 SENSORS - not implemented yet (plan.md Phase 3).
-	uint32_t featureBitmask =
-			kFeaturePartialRefresh | kFeatureRle | kFeatureButtonEvents | kFeatureDrawingPrimitives | kFeatureInternalStorage;
+	uint32_t featureBitmask = kFeaturePartialRefresh | kFeatureRle | kFeatureButtonEvents | kFeatureDrawingPrimitives |
+			kFeatureInternalStorage | kFeatureInlineImageDraw;
 	if (board::kPinSdCs >= 0) {
 		featureBitmask |= kFeatureSdCardSlot;
 	}
@@ -2086,6 +2087,7 @@ void handleDrawText(const CommandContext& ctx) {
 }
 
 constexpr size_t kDrawImageHeaderSize = 8;  // X/Y/DRAW_MODE/FLAGS/VOLUME/PATH_LEN
+constexpr size_t kDrawImageDataHeaderSize = 10;  // X/Y/DRAW_MODE/FLAGS/DATA_LEN
 constexpr size_t kEpiHeaderSize = 19;	 // MAGIC+FORMAT_VERSION+WIDTH+HEIGHT+ENCODING+FLAGS+COLOR_DECODED_LEN+COLOR_ENCODED_LEN
 constexpr uint8_t kEpiFormatVersion = 0x01;
 // Sanity cap against a corrupt/malicious .epi file claiming an enormous WIDTH*HEIGHT (e.g. read
@@ -2115,21 +2117,12 @@ struct DecodedEpiImage {
 	std::vector<uint8_t> maskData;
 };
 
-// Downloads, parses, and decodes one .epi file (§14 VOLUME) - does not draw anything (see
-// blitDecodedEpiImage() for that). Reuses decodeImageData() (the exact §6 RAW/RLE scheme) since the
-// .epi format's COLOR_DATA/MASK_DATA streams are byte-for-byte that same encoding.
-bool decodeEpiImage(uint8_t volumeValue, const std::string& path, DecodedEpiImage& outImage, uint8_t& failStatus) {
-	std::vector<uint8_t> fileData;
-	StorageManager::Result storageResult = gStorageManager.download(volumeValue, path, fileData);
-	if (storageResult == StorageManager::Result::kVolumeNotPresent) {
-		failStatus = status::kVolumeNotPresent;
-		return false;
-	}
-	if (storageResult != StorageManager::Result::kOk) {
-		failStatus = status::kFileNotFound;
-		return false;
-	}
-
+// Parses and decodes one already-in-memory .epi file - does not draw anything (see
+// blitDecodedEpiImage() for that) and does not care where the bytes came from (device storage via
+// decodeEpiImage() below, or embedded directly in a command payload, e.g. DRAW_IMAGE_DATA). Reuses
+// decodeImageData() (the exact §6 RAW/RLE scheme) since the .epi format's COLOR_DATA/MASK_DATA
+// streams are byte-for-byte that same encoding.
+bool decodeEpiFromBytes(const std::vector<uint8_t>& fileData, DecodedEpiImage& outImage, uint8_t& failStatus) {
 	if (fileData.size() < kEpiHeaderSize || std::memcmp(fileData.data(), "EPI1", 4) != 0 ||
 			fileData[4] != kEpiFormatVersion) {
 		failStatus = status::kDecodeFail;
@@ -2185,13 +2178,32 @@ bool decodeEpiImage(uint8_t volumeValue, const std::string& path, DecodedEpiImag
 	return true;
 }
 
+// Downloads one .epi file from device storage (§14 VOLUME) and decodes it via decodeEpiFromBytes()
+// - used by DRAW_IMAGE/DRAW_IMAGE_ROW, which reference a stored file rather than embedding one
+// inline (contrast DRAW_IMAGE_DATA, which calls decodeEpiFromBytes() directly on its own payload).
+bool decodeEpiImage(uint8_t volumeValue, const std::string& path, DecodedEpiImage& outImage, uint8_t& failStatus) {
+	std::vector<uint8_t> fileData;
+	StorageManager::Result storageResult = gStorageManager.download(volumeValue, path, fileData);
+	if (storageResult == StorageManager::Result::kVolumeNotPresent) {
+		failStatus = status::kVolumeNotPresent;
+		return false;
+	}
+	if (storageResult != StorageManager::Result::kOk) {
+		failStatus = status::kFileNotFound;
+		return false;
+	}
+	return decodeEpiFromBytes(fileData, outImage, failStatus);
+}
+
 // Blits an already-decoded image at (x,y) - non-ink/transparent (masked) pixels are skipped
 // entirely, never drawn, so DRAW_MODE never applies to them, matching §12.1's convention for
-// text/masked images. The caller must already have set gWorkingBufferGfx's draw mode.
-void blitDecodedEpiImage(const DecodedEpiImage& image, int16_t x, int16_t y) {
+// text/masked images - unless `ignoreMask` (FLAGS.IGNORE_MASK, drawImageFlags) is set, which draws
+// every pixel opaque regardless of the .epi data's own HAS_MASK/MASK_DATA. The caller must already
+// have set gWorkingBufferGfx's draw mode.
+void blitDecodedEpiImage(const DecodedEpiImage& image, int16_t x, int16_t y, bool ignoreMask = false) {
 	for (uint16_t row = 0; row < image.height; row++) {
 		for (uint16_t col = 0; col < image.width; col++) {
-			if (image.hasMask && !getPackedBit(image.maskData, image.width, col, row)) {
+			if (!ignoreMask && image.hasMask && !getPackedBit(image.maskData, image.width, col, row)) {
 				continue;
 			}
 			bool black = getPackedBit(image.colorData, image.width, col, row);
@@ -2237,7 +2249,47 @@ void handleDrawImage(const CommandContext& ctx) {
 	}
 
 	gWorkingBufferGfx.setDrawMode(mode);
-	blitDecodedEpiImage(image, x, y);
+	blitDecodedEpiImage(image, x, y, (flags & drawImageFlags::kIgnoreMask) != 0);
+
+	finishDraw(x, y, image.width, image.height, flags);
+	ctx.ack();
+}
+
+// doc/PROTOCOL.md §12.x DRAW_IMAGE_DATA: like DRAW_IMAGE but the `.epi` image is embedded in DATA
+// rather than referenced by a stored path - no prior FILE_UPLOAD needed. DATA is parsed with the
+// exact same rules as the .epi file format (decodeEpiFromBytes(), shared verbatim with DRAW_IMAGE),
+// including the IGNORE_MASK flag handling.
+void handleDrawImageData(const CommandContext& ctx) {
+	if (board::kPinDisplayCs < 0) {
+		ctx.nack(status::kUnsupportedCommand);
+		return;
+	}
+	const std::vector<uint8_t>& payload = ctx.request.payload;
+	if (payload.size() < kDrawImageDataHeaderSize) {
+		ctx.nack(status::kBadParameters);
+		return;
+	}
+
+	int16_t x = static_cast<int16_t>(readU16LE(&payload[0]));
+	int16_t y = static_cast<int16_t>(readU16LE(&payload[2]));
+	uint8_t mode = payload[4];
+	uint8_t flags = payload[5];
+	uint32_t dataLen = readU32LE(&payload[6]);
+	if (mode > drawMode::kAnd || payload.size() != kDrawImageDataHeaderSize + dataLen) {
+		ctx.nack(status::kBadParameters);
+		return;
+	}
+	std::vector<uint8_t> epiBytes(payload.begin() + kDrawImageDataHeaderSize, payload.end());
+
+	DecodedEpiImage image;
+	uint8_t failStatus;
+	if (!decodeEpiFromBytes(epiBytes, image, failStatus)) {
+		ctx.nack(failStatus);
+		return;
+	}
+
+	gWorkingBufferGfx.setDrawMode(mode);
+	blitDecodedEpiImage(image, x, y, (flags & drawImageFlags::kIgnoreMask) != 0);
 
 	finishDraw(x, y, image.width, image.height, flags);
 	ctx.ack();
@@ -3502,6 +3554,7 @@ void setup() {
 	gDispatcher.registerHandler(cmd::kClearRegion, handleClearRegion, authLevel::kUsage);
 	gDispatcher.registerHandler(cmd::kDrawText, handleDrawText, authLevel::kUsage);
 	gDispatcher.registerHandler(cmd::kDrawImage, handleDrawImage, authLevel::kUsage);
+	gDispatcher.registerHandler(cmd::kDrawImageData, handleDrawImageData, authLevel::kUsage);
 	gDispatcher.registerHandler(cmd::kDrawImageRow, handleDrawImageRow, authLevel::kUsage);
 	gDispatcher.registerHandler(cmd::kFillImage, handleFillImage, authLevel::kUsage);
 	gDispatcher.registerHandler(cmd::kFastClear, handleFastClear, authLevel::kUsage);

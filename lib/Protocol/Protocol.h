@@ -74,6 +74,7 @@ constexpr uint16_t kDrawImageRow = 0x030C;
 constexpr uint16_t kFillImage = 0x030D;
 constexpr uint16_t kFastClear = 0x030E;
 constexpr uint16_t kSetCustomFontFolder = 0x030F;
+constexpr uint16_t kDrawImageData = 0x0310;
 
 constexpr uint16_t kConfigBackupRequest = 0x0400;
 constexpr uint16_t kConfigBackupData = 0x0401;
@@ -260,6 +261,15 @@ constexpr uint8_t kOpaque = 0x01;
 namespace drawTextFlags {
 constexpr uint8_t kTextIsPath = 1u << 2;
 }  // namespace drawTextFlags
+
+// ---- DRAW_IMAGE/DRAW_IMAGE_DATA-specific FLAGS bit (doc/PROTOCOL.md §12.7) - bits0-1 remain the
+// shared §2.1 REFRESH_NOW/REFRESH_FULL meaning. IGNORE_MASK: draw every pixel opaque, ignoring the
+// .epi data's own HAS_MASK/MASK_DATA if present - the caller's override of the default
+// mask-respecting behavior, not a property of the .epi file itself.
+
+namespace drawImageFlags {
+constexpr uint8_t kIgnoreMask = 1u << 2;
+}  // namespace drawImageFlags
 
 // ---- SHIFT_REGION direction byte (doc/PROTOCOL.md §12.9) ---------------------------------------
 

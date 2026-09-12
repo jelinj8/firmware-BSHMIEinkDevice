@@ -228,6 +228,7 @@ Concrete IDs:
 0x030D FILL_IMAGE                PC → device [USAGE]
 0x030E FAST_CLEAR                PC → device [USAGE] (§12.16)
 0x030F SET_CUSTOM_FONT_FOLDER    PC → device [USAGE] (§12.6.2)
+0x0310 DRAW_IMAGE_DATA           PC → device [USAGE] (§12.17)
 
 0x0400 CONFIG_BACKUP_REQUEST     PC → device [USAGE]
 0x0401 CONFIG_BACKUP_DATA        device → PC
@@ -326,7 +327,9 @@ TYPE  Name                            Size      Meaning
                                                  bit6 internal storage available,
                                                  bit7 GPIO control available,
                                                  bit8 power management available (§17),
-                                                 bits9-31 reserved
+                                                 bit9 DRAW_IMAGE_DATA (inline-compressed-data draw,
+                                                 §12.17) available,
+                                                 bits10-31 reserved
 0x07  DEVICE_MODEL                    ≤32       UTF-8, not null-terminated
 0x08  FIRMWARE_VERSION                ≤16       UTF-8
 0x09  MAX_FULL_IMAGE_BYTES            4 u32 LE  Max decoded payload accepted for full-image transfer
@@ -847,13 +850,19 @@ discards every cached glyph (§12.6.1) from whatever folder was active before, t
 
 ### 12.7 `0x0305` DRAW_IMAGE
 ```
-0 2 X   2 2 Y   4 1 DRAW_MODE   5 1 FLAGS (§2.1)
+0 2 X   2 2 Y   4 1 DRAW_MODE   5 1 FLAGS (§2.1 + bit2 IGNORE_MASK, see below)
 6 1 VOLUME (§14): 0x00 SD, 0x01 INTERNAL, 0x02 PSRAM
 7 1 PATH_LEN (u8, max 255)
 8 PATH_LEN PATH   UTF-8 path, e.g. "/icons/wifi.epi" (SD) or "wifi" (INTERNAL/PSRAM)
 ```
 
 Image dimensions come from the referenced file's own header.
+
+`FLAGS` bit2 `IGNORE_MASK`: draws every pixel opaque, ignoring the referenced `.epi` file's own
+`HAS_MASK`/`MASK_DATA` if present — the caller's override of the default mask-respecting behavior,
+not a property of the `.epi` file itself. Reserved/unset (0) preserves the original
+always-respect-mask behavior; receivers predating this bit simply never see it set. Shared verbatim
+with `DRAW_IMAGE_DATA` (§12.17).
 
 #### Image file format (`.epi`, referenced by `DRAW_IMAGE` and §14 file transfer)
 
@@ -1077,7 +1086,28 @@ that pipeline. There is no persistent "current brush/background color" concept a
 protocol to default `COLOR` from — every command that draws a solid fill (`CLEAR_REGION`, §12.5;
 this one) always takes it explicitly, the same as every other primitive's own `COLOR` field.
 
-`0x0310`–`0x03FF` reserved.
+### 12.17 `0x0310` DRAW_IMAGE_DATA
+
+Requires `FEATURE_BITMASK` bit9 (§5.2) — clients targeting firmware that may predate this command
+should check the bit or handle `NACK(UNSUPPORTED_COMMAND)`.
+
+```
+Offset  Size      Field       Notes
+0       2         X           u16 LE
+2       2         Y           u16 LE
+4       1         DRAW_MODE   §12.1 enum, same as DRAW_IMAGE
+5       1         FLAGS       §2.1 + bit2 IGNORE_MASK (§12.7)
+6       4         DATA_LEN    u32 LE, byte length of DATA
+10      DATA_LEN  DATA        one complete .epi file (§12.7's Image file format), verbatim
+```
+
+Like `DRAW_IMAGE` (§12.7) but the `.epi` image is embedded in `DATA` rather than referenced by a
+stored path — no prior `FILE_UPLOAD` needed. `DATA` is parsed with the exact same rules as the
+Image file format under §12.7 (same `MAGIC`/`FORMAT_VERSION`/`ENCODING`/mask handling, including
+`IGNORE_MASK`); malformed `MAGIC`/`FORMAT_VERSION`/length fields → `NACK(BAD_PARAMETERS)`; a
+corrupt RLE stream → `NACK(DECODE_FAIL)`, mirroring §6's decode contract.
+
+`0x0311`–`0x03FF` reserved.
 
 ## 13. Configuration (`0x0400`–`0x04FF`)
 
