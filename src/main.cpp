@@ -2040,7 +2040,11 @@ constexpr size_t kDrawTextHeaderSize = 15;
 // parametrized by writing new content to that file before each replay rather than needing a
 // different macro per value. No VOLUME field exists on this command's own payload, so an optional
 // "R:"/"S:"/"F:" prefix on TEXT picks PSRAM/SD/INTERNAL (stripped before the rest is used as the
-// path); no prefix defaults to PSRAM.
+// path); no prefix defaults to PSRAM. FLAGS.MISSING_FILE_TOLERANT (only meaningful alongside
+// TEXT_IS_PATH) turns a missing referenced file from NACK(FILE_NOT_FOUND) into a no-op ACK -
+// nothing painted, working buffer left untouched - for callers (e.g. a boot/status macro) that
+// would rather silently skip a line than fail the whole command when its backing file hasn't been
+// written yet.
 void handleDrawText(const CommandContext& ctx) {
 	if (board::kPinDisplayCs < 0) {
 		ctx.nack(status::kUnsupportedCommand);
@@ -2098,6 +2102,12 @@ void handleDrawText(const CommandContext& ctx) {
 			return;
 		}
 		if (storageResult != StorageManager::Result::kOk) {
+			if (flags & drawTextFlags::kMissingFileTolerant) {
+				// No usable text to draw and the caller opted in to tolerating that - skip the
+				// draw entirely (working buffer left untouched) rather than failing the command.
+				ctx.ack();
+				return;
+			}
 			ctx.nack(status::kFileNotFound);
 			return;
 		}

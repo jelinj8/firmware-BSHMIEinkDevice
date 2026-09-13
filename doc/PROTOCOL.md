@@ -696,7 +696,9 @@ Every command below carries the shared `FLAGS` byte from §2.1.
 12 1 FLAGS (§2.1)  bits0-1 REFRESH_NOW/REFRESH_FULL (§2.1); bit2 TEXT_IS_PATH (DRAW_TEXT-specific -
                     TEXT below is a UTF-8 path rather than literal text; the referenced file's own
                     content, read fresh every time this command runs, becomes the text to draw);
-                    bits3-7 reserved
+                    bit3 MISSING_FILE_TOLERANT (DRAW_TEXT-specific, only meaningful together with
+                    bit2 - if the referenced file doesn't exist, ACK with nothing drawn instead of
+                    NACK(FILE_NOT_FOUND)); bits4-7 reserved
 13 2 TEXT_LEN   u16 LE, byte length of the UTF-8 string (or, if FLAGS.TEXT_IS_PATH, path) that
                  follows
 15 TEXT_LEN TEXT  UTF-8 bytes (accented characters via multi-byte sequences, e.g. Latin-1
@@ -710,7 +712,18 @@ Every command below carries the shared `FLAGS` byte from §2.1.
 display to a file, record/save a `DRAW_TEXT` that references that file by path instead of embedding
 the text directly, and replaying the same saved macro later — after writing different content to
 that file — draws the new text, with the macro itself never re-recorded or re-encoded.
-`NACK(FILE_NOT_FOUND)` if the referenced file doesn't exist.
+`NACK(FILE_NOT_FOUND)` if the referenced file doesn't exist — unless `FLAGS.MISSING_FILE_TOLERANT`
+(bit3) is also set, in which case a missing file makes the command a no-op instead: `ACK`, nothing
+painted, working buffer left exactly as it was. Meant for callers (e.g. a boot-time status display)
+that would rather silently skip one line than fail the whole draw because its backing file hasn't
+been written yet — mirrors the same soft-fallback-vs-hard-error shape `FONT_ID=0xFF`'s own `XX.gly`
+fallback already uses (§12.6.1): a single missing glyph silently substitutes rather than NACKing,
+while a genuinely unusable request (there, no fallback available at all; here,
+`MISSING_FILE_TOLERANT` unset) still NACKs. `MISSING_FILE_TOLERANT` has no effect without
+`TEXT_IS_PATH` also set (literal-text draws never reference a file, so there's nothing to be
+tolerant about) and does not cover `VOLUME=SD` being entirely absent —
+`NACK(VOLUME_NOT_PRESENT)` for that case is unchanged regardless of this bit, since that's a
+storage-availability problem rather than a single missing file.
 
 `DRAW_TEXT`'s own payload has no `VOLUME` field (unlike `DRAW_IMAGE`, §12.7) — instead, `TEXT` may
 carry an optional 2-byte volume prefix: `R:` selects `VOLUME=PSRAM`, `S:` selects `VOLUME=SD`, `F:`

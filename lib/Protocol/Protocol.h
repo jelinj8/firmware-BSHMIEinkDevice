@@ -257,9 +257,16 @@ constexpr uint8_t kOpaque = 0x01;
 // on TEXT itself - "R:" PSRAM, "S:" SD, "F:" INTERNAL (flash) - stripped before the rest is used as
 // the actual path; no prefix (or any other/unrecognized one) defaults to PSRAM with TEXT used
 // as-is, unstripped.
+// MISSING_FILE_TOLERANT: only meaningful together with TEXT_IS_PATH. Without it (today's original
+// behavior), a missing referenced file is NACK(FILE_NOT_FOUND). With it, a missing file makes the
+// command a no-op draw - ACK, nothing painted - instead of a hard error. Mirrors the two-tier
+// soft-fallback/hard-error shape FONT_ID=0xFF's own XX.gly fallback already established (§12.6.1):
+// a single missing glyph silently falls back rather than NACKing, but a genuinely unusable request
+// (there, no usable fallback at all; here, MISSING_FILE_TOLERANT unset) still NACKs.
 
 namespace drawTextFlags {
 constexpr uint8_t kTextIsPath = 1u << 2;
+constexpr uint8_t kMissingFileTolerant = 1u << 3;
 }  // namespace drawTextFlags
 
 // ---- DRAW_IMAGE/DRAW_IMAGE_DATA-specific FLAGS bit (doc/PROTOCOL.md §12.7) - bits0-1 remain the
