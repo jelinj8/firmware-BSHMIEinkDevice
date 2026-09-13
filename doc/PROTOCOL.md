@@ -3704,6 +3704,33 @@ if they turn out to matter in practice:
     re-check (fresh lease should now show `CrowPanel-3851DC`, not `esp32s3-3851DC`) is the user's
     own next step to fully close this out.
 
+    **This fix regressed on the very next real reboot - the actual root cause was one level up.**
+    Tested against a second, brand-new device (never before seen by the router, so no stale-ARP
+    ambiguity possible): its first-ever `SET_WIFI_CONFIG` correctly registered as
+    `CrowPanel-A5A364` in DHCP - the fix looked complete. But after power-cycling that same device,
+    its DHCP entry reverted to `esp32s3-A5A364`, despite `DEVICE_NAME`/mDNS still reporting the
+    correct name. Root cause: `connectWifiAndStartTcpServer()` (called once, at boot) had its own
+    unconditional `WiFi.mode(WIFI_STA)` call *before* ever reaching `startWifiOrPowerOff()` -
+    originally added, per its own now-stale comment, to "initialize the WiFi driver so the MAC
+    (`deviceName()`) is available even if we never actually associate." That reasoning no longer
+    holds: `WiFiSTAClass::macAddress()` (arduino-esp32's `WiFiSTA.cpp`) reads the MAC via
+    `esp_read_mac()` directly whenever `WiFi.getMode()==WIFI_MODE_NULL` - no prior `mode()` call
+    needed at all. Worse, that early call was quietly *the* real first `WIFI_STA` transition every
+    cold boot, always ahead of `startWifiOrPowerOff()`'s own (already-corrected) ordering - so by
+    the time that ran, `WiFiGenericClass::mode()`'s `if(cm == m) return true` early-return made its
+    own `mode(WIFI_STA)` call a no-op (mode was already STA), silently skipping the hostname push
+    that only happens on an actual mode change. The `SET_WIFI_CONFIG`-triggered connect "worked"
+    only because that code path runs without ever calling `WiFi.mode(WIFI_STA)` first - the very
+    first real STA transition, for that call, genuinely was inside `startWifiOrPowerOff()`. A cold
+    boot always calls `connectWifiAndStartTcpServer()` first, so it always hit the bug; anything
+    that skipped that early call (an in-session `SET_WIFI_CONFIG`/`SET_WIFI_ENABLED`) didn't.
+    Fix: removed `connectWifiAndStartTcpServer()`'s own early `WiFi.mode(WIFI_STA)` entirely,
+    making `startWifiOrPowerOff()` the sole place `WIFI_STA` is ever entered, so its already-fixed
+    ordering is no longer preempted by anything upstream.
+    **Verified**: `pio run` builds clean; real-hardware confirmation (OTA, then a genuine reboot -
+    not just an in-session reconnect - followed by a router DHCP re-check) still pending as of this
+    note, since that's exactly the scenario the first fix silently didn't cover.
+
     **Unrelated BLE-transport observation from OTAing this same fix**: three consecutive BLE `OTA`
     attempts (one mid-transfer `BLE characteristic write failed`, one `BLE connect failed`, one
     handshake timeout) all failed back-to-back right after a *soft*-rebooted device (i.e., the

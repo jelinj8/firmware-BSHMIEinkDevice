@@ -496,11 +496,23 @@ void startTcpServerIfNeeded() {
 // works regardless. Only used for the initial boot-time attempt - a live reconnect triggered by
 // SET_WIFI_CONFIG/SET_WIFI_ENABLED must never block loop() like this does, see those handlers.
 void connectWifiAndStartTcpServer() {
-	// Unconditional: initializes the WiFi driver so the MAC (deviceName()) is available even if we
-	// never actually associate (e.g. no credentials configured yet) - startWifiOrPowerOff() below
-	// still correctly reverses this to WIFI_OFF in that case, it just doesn't skip this first call.
-	WiFi.mode(WIFI_STA);
-
+	// No longer an unconditional WiFi.mode(WIFI_STA) here first (design note 102's own earlier
+	// fix): that call's original stated purpose - "initializes the WiFi driver so the MAC
+	// (deviceName()) is available even if we never actually associate" - turned out to be
+	// unnecessary: WiFiSTAClass::macAddress() (arduino-esp32's WiFiSTA.cpp) reads the MAC via
+	// esp_read_mac() directly whenever WiFi.getMode()==WIFI_MODE_NULL, no prior mode() transition
+	// needed. Worse, this call being here at all was actively wrong: it was itself the *real*
+	// first WIFI_STA transition every cold boot, always ahead of startWifiOrPowerOff()'s own
+	// (already-corrected) setHostname()-then-mode(WIFI_STA) pair below - so by the time that ran,
+	// WiFiGenericClass::mode()'s own "if(cm == m) return true" early-return made its mode(STA)
+	// call a no-op (mode was already STA from here), silently skipping the hostname push that
+	// only happens inside that one function, on an actual mode change. Found live: the very
+	// design-note-102 fix regressed on the next real reboot, back to the arduino-esp32 default
+	// "esp32s3-XXYYZZ" hostname, despite deviceName()/mDNS still correctly showing
+	// "CrowPanel-XXYYZZ" - because this line, not startWifiOrPowerOff(), was quietly winning the
+	// only mode(STA) transition that actually mattered for DHCP. Removing it makes
+	// startWifiOrPowerOff() the sole place WIFI_STA is ever entered, so its already-correct
+	// ordering is no longer preempted.
 	if (!wifiEnabledSetting()) {
 		Serial.println("WiFi: disabled by a persisted SET_WIFI_ENABLED(0) - TCP transport unavailable "
 						"this session");
