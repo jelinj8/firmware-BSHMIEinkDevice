@@ -269,6 +269,11 @@ void selfTest() {
 // forward-declared so the cold-boot screen below, which runs earlier in setup(), can call it.
 std::string deviceName();
 
+// wifiStatusLabel()/bleStatusLabel() are defined further down (after Preferences/kPrefKey* are set
+// up), forward-declared for the same reason as deviceName() above.
+std::string wifiStatusLabel();
+std::string bleStatusLabel();
+
 // SSD1683 bring-up (next-steps.md #3, doc/PROTOCOL.md §6/§12): proves the display SPI wiring and
 // driver init independently of the protocol layer, and shows a cold-boot info screen identifying
 // the loaded firmware, device, and resolution - requested directly: "add a cold boot screen...
@@ -282,7 +287,12 @@ std::string deviceName();
 // own _initial_write/_initial_refresh flags (gdey/GxEPD2_420_GDEY042T81.cpp) already force the
 // very first write+refresh after init() through a full update automatically regardless of what
 // this call itself requests, so a preliminary black/white pass was never actually needed for a
-// clean result - confirmed clean on real hardware, not just assumed.
+// clean result - confirmed clean on real hardware, not just assumed. Also shows WiFi/BLE status
+// (wifiStatusLabel()/bleStatusLabel(), below) - requested directly: "default boot macro could also
+// show wifi off/unconfigured/on, BLE off/on" - added to this native screen rather than a macro,
+// since this is where firmware/device/resolution were already being shown. Both labels read only
+// persisted configuration, not live connection state, since this runs before
+// connectWifiAndStartTcpServer()/setupBle() (setup(), below) ever touch the radios.
 void displaySelfTest() {
 	if (board::kPinDisplayCs < 0) {
 		Serial.println("Display: pins not configured for this board - skipping self-test");
@@ -304,9 +314,10 @@ void displaySelfTest() {
 	gDisplay.init(/*serial_diag_bitrate=*/0, /*initial=*/true, /*reset_duration=*/10, /*pulldown_rst_mode=*/false);
 
 	unsigned long start = millis();
-	char line[128];  // kFirmwareVersion now carries a build timestamp too, longer than it used to be
-	int len = snprintf(line, sizeof(line), "FW  %s\nDEV %s\nRES %ux%u", kFirmwareVersion, deviceName().c_str(),
-			board::kDisplayWidthPx, board::kDisplayHeightPx);
+	char line[192];  // kFirmwareVersion carries a build timestamp; +WIFI/BLE status lines below
+	int len = snprintf(line, sizeof(line), "FW  %s\nDEV %s\nRES %ux%u\nWIFI %s\nBLE  %s", kFirmwareVersion,
+			deviceName().c_str(), board::kDisplayWidthPx, board::kDisplayHeightPx, wifiStatusLabel().c_str(),
+			bleStatusLabel().c_str());
 	// Draws straight through WorkingBuffer/WorkingBufferGfx (§12's own path, the same one every
 	// DRAW_TEXT command uses) rather than gDisplay's higher-level Adafruit_GFX fillScreen()/print(),
 	// so this reuses the exact embedded font DRAW_TEXT itself renders with - opaqueBackground=true
@@ -416,6 +427,28 @@ void startWifiOrPowerOff(const std::string& ssid, const std::string& password) {
 // deployments that never touch this setting keep today's always-on behavior unchanged.
 bool wifiEnabledSetting() {
 	return gPrefs.getBool(kPrefKeyWifiEnabled, true);
+}
+
+// Cold-boot-screen (displaySelfTest(), above) WiFi status label - "off" (SET_WIFI_ENABLED
+// disabled), "unconfigured" (enabled, but no SSID resolves - neither a persisted SET_WIFI_CONFIG
+// nor a compile-time secrets.h fallback), or "on" (enabled and about to try connecting). Reuses
+// wifiEnabledSetting()/resolveWifiCredentials() exactly as every other call site does; this is
+// config state only, not live connection status, since displaySelfTest() runs before
+// connectWifiAndStartTcpServer() ever calls WiFi.begin().
+std::string wifiStatusLabel() {
+	if (!wifiEnabledSetting()) {
+		return "off";
+	}
+	std::string ssid, password;
+	resolveWifiCredentials(ssid, password);
+	return ssid.empty() ? "unconfigured" : "on";
+}
+
+// Cold-boot-screen BLE status label - "off"/"on" mirroring kPrefKeyBleEnabled. Reads gPrefs
+// directly rather than the runtime gBleEnabled mirror, since that isn't loaded from NVS until
+// setupBle() (setup(), below), which - like WiFi - runs after this screen is already drawn.
+std::string bleStatusLabel() {
+	return gPrefs.getBool(kPrefKeyBleEnabled, true) ? "on" : "off";
 }
 
 // Starts the TCP server and the mDNS responder the first time WiFi is actually associated - called

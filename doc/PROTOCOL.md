@@ -3640,6 +3640,41 @@ if they turn out to matter in practice:
     for future BLE-transport verification if the usual Windows dev machine's BLE stack is ever
     wedged again like this.
 
+100. **`DRAW_TEXT FLAGS.MISSING_FILE_TOLERANT` (bit3, §12.6)**, requested directly: "The path
+    referencing draw text needs to tolerate file not found (draw nothing? Default value to use if
+    not found would be probably complicated, but would allow error if not specified and file not
+    found or clean route if specified). We can extend current command, still in design phase so no
+    other API consumers that might break." Scoped down to the simpler of the two options discussed:
+    draw-nothing-if-missing only, no default-value/fallback-text field — deferred as genuinely more
+    complex (a second TEXT-like field, not just a flag bit) and not needed yet.
+    Only meaningful together with `FLAGS.TEXT_IS_PATH` (bit2): `handleDrawText()`'s existing
+    `NACK(FILE_NOT_FOUND)` path (design note 89's own addition) now checks this bit first and, if
+    set, `ctx.ack()`s with nothing drawn instead — working buffer left exactly as it was. Mirrors
+    the two-tier soft-fallback/hard-error shape `FONT_ID=0xFF`'s own `XX.gly` fallback already
+    established (design note 93, §12.6.1): a single missing glyph silently substitutes rather than
+    NACKing, while a genuinely unusable request still does. `VOLUME_NOT_PRESENT` (a whole volume
+    missing, not a single file) is unaffected by this bit either way - it's a storage-availability
+    problem, not something "tolerating a missing file" addresses.
+    **Verified**: `pio run` (esp32-s3-crowpanel) builds clean. Companion client-side
+    `DrawTextFlags.MISSING_FILE_TOLERANT` lands in `pc-java-lib`, same bit value.
+
+101. **Cold-boot screen (design note 83) now also shows WiFi/BLE status**, requested directly: "The
+    default boot macro could also show wifi off/unconfigured/on, BLE off/on" - implemented on the
+    existing native `displaySelfTest()` screen rather than a new macro/variable mechanism, since
+    that's already where firmware/device/resolution get shown at cold boot, and it runs before the
+    macro system or WiFi/BLE subsystems even start.
+    That ordering matters: `displaySelfTest()` (called from `setup()`) runs before
+    `connectWifiAndStartTcpServer()`/`setupBle()`, so there's no live connection state yet - the two
+    new lines (`wifiStatusLabel()`/`bleStatusLabel()`, defined near `wifiEnabledSetting()`) read
+    only persisted configuration (`gPrefs`) instead: WiFi is `off` (`SET_WIFI_ENABLED` disabled),
+    `unconfigured` (enabled but no SSID resolves, matching `resolveWifiCredentials()`'s own
+    persisted-then-`secrets.h`-fallback check), or `on`; BLE is `off`/`on` mirroring
+    `kPrefKeyBleEnabled` directly, since the runtime `gBleEnabled` mirror isn't loaded from NVS
+    until `setupBle()`, which also runs after this screen. Both helpers are forward-declared above
+    `displaySelfTest()`, the same pattern `deviceName()` already uses for the same reason.
+    **Verified**: `pio run` (esp32-s3-crowpanel) builds clean; real-hardware visual confirmation
+    (via a fresh OTA/reflash) still pending as of this note.
+
 ## 22. Implementation status
 
 - **`pc-java-lib/`** — **BSHMIProtocol** (`cz.bliksoft.hmieink:bshmiprotocol`, package
