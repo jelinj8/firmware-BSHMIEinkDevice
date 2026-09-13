@@ -3704,6 +3704,22 @@ if they turn out to matter in practice:
     re-check (fresh lease should now show `CrowPanel-3851DC`, not `esp32s3-3851DC`) is the user's
     own next step to fully close this out.
 
+    **Unrelated BLE-transport observation from OTAing this same fix**: three consecutive BLE `OTA`
+    attempts (one mid-transfer `BLE characteristic write failed`, one `BLE connect failed`, one
+    handshake timeout) all failed back-to-back right after a *soft*-rebooted device (i.e., the
+    previous OTA's own `ESP.restart()`, §16.2 - ADMIN `OTA_APPLY`/`APPLY_NOW` always reboots this
+    way, never a true power-on reset) - the device scanned/advertised fine throughout, only
+    connect/transfer failed. A real power cycle (user-initiated) immediately fixed it - the very
+    next BLE `OTA` attempt succeeded first try. Consistent with a known NimBLE/ESP32 failure class:
+    `ESP.restart()` never gives the previous BLE central (here, the PC's own OTA tool) a chance to
+    cleanly disconnect first - the device simply vanishes mid-session - which can leave the
+    NimBLE controller in a state a soft reset doesn't fully clear, unlike a true power-on reset of
+    the radio silicon. Not yet root-caused or fixed in firmware (e.g. an explicit
+    `NimBLEDevice::stopAdvertising()`/disconnect-and-settle step before `ESP.restart()` in
+    `handleOtaApply()`/`APPLY_NOW`'s reboot path might help) - recorded here since it's now been
+    seen more than once and cost real debugging time; worth a real fix if BLE OTA continues to be
+    unreliable immediately after a prior OTA.
+
 ## 22. Implementation status
 
 - **`pc-java-lib/`** — **BSHMIProtocol** (`cz.bliksoft.hmieink:bshmiprotocol`, package
