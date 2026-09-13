@@ -1772,12 +1772,20 @@ void handleClearArtifacts(const CommandContext& ctx) {
 	uint8_t flags = payload[1];
 
 	gDisplay.setFullWindow();
+	// GxEPD2_420_GDEY042T81::useFastFullUpdate=true (its own default) makes every full update here
+	// use the SSD1683's fast, non-flashing waveform (register 0x22=0xD7) - the factory firmware's own
+	// EPD_Clear() instead used the real full waveform (0x22=0xF7), whose ghost-removal LUT flashes
+	// black/white internally in hardware as part of one update. selectFastFullUpdate(false)/(true)
+	// brackets just this cycle loop to borrow that real waveform for a genuine flash, without
+	// affecting any other full update in the firmware (normal drawing, FAST_CLEAR, boot screen).
+	gDisplay.epd2.selectFastFullUpdate(false);
 	for (uint8_t i = 0; i < cycles; i++) {
 		gDisplay.fillScreen(GxEPD_BLACK);
 		gDisplay.display(/*partial_update_mode=*/false);
 		gDisplay.fillScreen(GxEPD_WHITE);
 		gDisplay.display(/*partial_update_mode=*/false);
 	}
+	gDisplay.epd2.selectFastFullUpdate(true);
 
 	if (flags & clearArtifactsFlags::kRestoreContent) {
 		gWorkingBuffer.flush(0, 0, GxEPD2_420_GDEY042T81::WIDTH, GxEPD2_420_GDEY042T81::HEIGHT, /*full=*/true);
