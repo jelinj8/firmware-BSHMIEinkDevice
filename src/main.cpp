@@ -99,6 +99,7 @@ constexpr char kFirmwareVersion[] = "0.1.0-dev (" __DATE__ " " __TIME__ ")";
 
 constexpr uint16_t kTcpPort = 5577;  // doc/PROTOCOL.md §3.2 - no well-known port, this project's choice
 constexpr unsigned long kWifiConnectTimeoutMs = 15000;
+constexpr unsigned long kOtaConfirmTimeoutMs = 5 * 60 * 1000;	// §16.4 auto-rollback safety net
 constexpr uint16_t kBlePreferredMtu = 247;	 // doc/PROTOCOL.md §3.1 - NimBLE-Arduino's usual practical ceiling
 constexpr uint32_t kBleStreamBufSize = 1024;  // NimBLEStreamServer's own default; fine for now, see §3.1
 
@@ -1250,6 +1251,33 @@ uint8_t otaSlotIndex(const esp_partition_t* partition) {
 		return 0;
 	}
 	return static_cast<uint8_t>(partition->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_MIN);
+}
+
+// Arduino's own initArduino() runs before setup() and immediately auto-confirms any pending OTA image
+// unless this weak hook says otherwise (esp32-hal-misc.c in the Arduino-ESP32 core:
+// `if (!verifyRollbackLater()) { ...if PENDING_VERIFY: verifyOta() ? mark_valid : mark_invalid... }`)
+// - without this override, OTA_STATUS_RESPONSE.PENDING_VERIFICATION and OTA_CONFIRM never see a real
+// pending state at all (confirmed on real hardware: PENDING_VERIFICATION read 0 immediately after a
+// fresh OTA boot, before OTA_CONFIRM was ever sent). extern "C" is required: the weak symbol lives in
+// a plain .c file with C linkage, so a plain C++ definition here would mangle to a different symbol
+// and silently fail to override it (same extern "C" pattern used by this framework's own
+// libraries/RainMaker/src/RMaker.cpp).
+extern "C" bool verifyRollbackLater() {
+	return true;
+}
+
+// doc/PROTOCOL.md §16.4's proactive half of the auto-rollback safety net: if OTA_CONFIRM never arrives
+// (a bad image that boots and runs but is otherwise unreachable - not a crash, which the bootloader's
+// own PENDING_VERIFY-not-cleared check already catches on the next boot), force a rollback rather than
+// wait forever for a PC that may never reconnect. Called from loop() (see below).
+void checkOtaAutoRollback() {
+	const esp_partition_t* running = esp_ota_get_running_partition();
+	esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+	esp_ota_get_state_partition(running, &state);
+	if (state == ESP_OTA_IMG_PENDING_VERIFY && millis() > kOtaConfirmTimeoutMs) {
+		esp_ota_mark_app_invalid_rollback_and_reboot();  // same API initArduino() itself would have
+														  // used on a failed verifyOta()
+	}
 }
 
 void handleOtaInstall(const CommandContext& ctx) {
@@ -3600,4 +3628,5 @@ void loop() {
 	gGpioController.update();
 	gButtonController.update();
 	gStorageManager.updateIdlePowerDown();
+	checkOtaAutoRollback();
 }

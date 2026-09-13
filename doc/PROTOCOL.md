@@ -1505,10 +1505,22 @@ Response:
 Empty payload. Marks the currently running (freshly updated) firmware as valid — cancels ESP-IDF's
 automatic rollback-on-next-boot for this image (`esp_ota_mark_app_valid_cancel_rollback()`). This
 is the safety net that makes OTA over a wireless link low-risk: if a new image is bad enough that
-the PC can never re-establish a connection to send `OTA_CONFIRM`, firmware should fall back to
-auto-reverting to the previous slot after a boot/self-test timeout even without an explicit
-`OTA_ROLLBACK` (§16.5) — the exact timeout and self-test criteria are a firmware policy choice, not
-specified here.
+the PC can never re-establish a connection to send `OTA_CONFIRM`, firmware falls back to
+auto-reverting to the previous slot without an explicit `OTA_ROLLBACK` (§16.5), two ways:
+
+- **On a crash or unexpected reset** before `OTA_CONFIRM` arrives: ESP-IDF's own bootloader-level
+  rollback fires on the *next* boot attempt, since the image is still sitting in
+  `ESP_OTA_IMG_PENDING_VERIFY` state — no firmware code of ours is involved.
+- **On an image that boots and keeps running but is otherwise unreachable** (no crash to trigger
+  the case above): a 5-minute timeout, checked once per `loop()` iteration against
+  `esp_ota_get_state_partition()` — still `PENDING_VERIFY` after 5 minutes since boot means
+  `OTA_CONFIRM` never arrived, and firmware calls `esp_ota_mark_app_invalid_rollback_and_reboot()`
+  itself rather than waiting indefinitely.
+
+Both paths depend on the image actually reaching `PENDING_VERIFY` in the first place — Arduino-ESP32's
+own `initArduino()` auto-confirms any pending image by default before `setup()` ever runs (its weak
+`verifyRollbackLater()` hook defaults to skipping the deferral), so this firmware overrides that hook
+to return `true`, deferring the confirm decision to the two mechanisms above instead.
 
 ### 16.5 `0x0805` OTA_ROLLBACK (PC → device)
 
