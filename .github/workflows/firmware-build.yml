@@ -17,6 +17,12 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Needed for the "Attach firmware to the published release" step below - this repo's default
+    # GITHUB_TOKEN permissions are read-only, so softprops/action-gh-release's release-asset upload
+    # otherwise fails with "Resource not accessible by integration" (observed on the v0.1.1 release
+    # run, https://github.com/jelinj8/firmware-BSHMIEinkDevice/actions).
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
