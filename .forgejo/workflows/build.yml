@@ -16,14 +16,20 @@ jobs:
   build:
     runs-on: embedded
     # Pins PlatformIO's package/download cache to the runner's shared pio-cache volume (see
-    # K8s_Talos/talos-minipc/k8s_forgejo/04-runner-config-configmap.yaml) instead of the image's
-    # default $HOME/.platformio. Without this, every job re-downloads from scratch - confirmed
-    # 2026-09-14 against this exact repo/board (esp32-s3-crowpanel pulled
-    # toolchain-xtensa-esp32s3/toolchain-riscv32-esp plus all of NimBLE-Arduino/GxEPD2/Adafruit
-    # GFX/etc. on every run), since a job runs in a fresh container from the immutable base image
-    # and nothing baked into sys/runner-embedded covers this board or this project's lib_deps.
+    # K8s_Talos/talos-minipc/k8s_forgejo/04-runner-config-configmap.yaml). Without this, every job
+    # re-downloads from scratch - confirmed 2026-09-14 against this exact repo/board
+    # (esp32-s3-crowpanel pulled toolchain-xtensa-esp32s3/toolchain-riscv32-esp plus all of
+    # NimBLE-Arduino/GxEPD2/Adafruit GFX/etc. on every run), since a job runs in a fresh container
+    # from the immutable base image and nothing baked into sys/runner-embedded covers this board
+    # or this project's lib_deps.
+    #
+    # MUST be /root/.platformio specifically, not an arbitrary path (first attempt used
+    # /tmp/pio-core and broke this exact build 2026-09-14/15: esptool.py failed with
+    # "ModuleNotFoundError: No module named 'intelhex'", because that's where the Dockerfile's own
+    # `pio pkg install` built PlatformIO's managed Python venv at image-build time - pointing
+    # PLATFORMIO_CORE_DIR anywhere else discards that venv along with everything else baked in).
     env:
-      PLATFORMIO_CORE_DIR: /tmp/pio-core
+      PLATFORMIO_CORE_DIR: /root/.platformio
     strategy:
       matrix:
         # One entry per [env:...] block in platformio.ini that's a real device target (not the
