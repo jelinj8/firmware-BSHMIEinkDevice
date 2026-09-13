@@ -3672,8 +3672,37 @@ if they turn out to matter in practice:
     `kPrefKeyBleEnabled` directly, since the runtime `gBleEnabled` mirror isn't loaded from NVS
     until `setupBle()`, which also runs after this screen. Both helpers are forward-declared above
     `displaySelfTest()`, the same pattern `deviceName()` already uses for the same reason.
-    **Verified**: `pio run` (esp32-s3-crowpanel) builds clean; real-hardware visual confirmation
-    (via a fresh OTA/reflash) still pending as of this note.
+    **Verified end-to-end on real hardware**: OTA'd over both Serial and BLE; the cold-boot screen
+    visually confirmed showing correct WIFI/BLE status lines alongside FW/DEV/RES.
+
+102. **A real hostname bug found while verifying design note 80/mDNS again**: the router's DHCP
+    lease for this device still showed `esp32s3-3851DC` - arduino-esp32's own auto-generated
+    default (`WiFiGeneric.cpp`'s `get_esp_netif_hostname()`: `CONFIG_IDF_TARGET "-" + last 3 MAC
+    bytes`, i.e. literally `"esp32s3-" + MAC suffix`) - even on a freshly-issued (not stale) lease,
+    while `DEVICE_NAME`/mDNS both correctly reported `deviceName()`'s own `"CrowPanel-3851DC"`.
+    Root cause, found by reading the vendored arduino-esp32 core source directly rather than
+    assumed: `WiFiGenericClass::mode()` only pushes the hostname onto the actual netif/DHCP client
+    at the moment of the `WIFI_STA` transition itself (`WiFiGeneric.cpp`'s `mode()`, the
+    `m & WIFI_MODE_STA` branch), reading whatever its own internal default-hostname buffer holds
+    *right then* - `WiFi.setHostname()` only writes that buffer, it doesn't push anything to the
+    netif on its own. `startWifiOrPowerOff()` called `WiFi.mode(WIFI_STA)` *before*
+    `WiFi.setHostname(deviceName().c_str())`, so the very first STA transition after every boot
+    captured the arduino-esp32 default instead - `DEVICE_NAME`/mDNS looked correct only because
+    both re-read the buffer fresh, well after it had long since been corrected for future callers,
+    masking that the DHCP negotiation itself had already happened with the wrong value.
+    A later `SET_WIFI_ENABLED` disable/enable within the same boot happened to mask the bug by
+    luck - by then the buffer already held the right value from the earlier `setHostname()` call,
+    so the *next* `WIFI_STA` transition picked it up correctly - but the very first connection
+    after any reboot or OTA never did, which is exactly the scenario a real deployment hits every
+    time.
+    Fix: swapped the two calls - `WiFi.setHostname()` now runs before `WiFi.mode(WIFI_STA)`.
+    Confirmed safe to call in either order from the API itself: `setHostname()` only writes the
+    static buffer, no netif access, so it doesn't need `mode()` to have run first.
+    **Verified**: `pio run` builds clean; OTA'd over Serial, reconnected and confirmed, `ping
+    CrowPanel-3851DC.local` still resolves correctly post-fix (mDNS was never affected, as
+    expected - only the DHCP-negotiation-time hostname was wrong). Router DHCP client list
+    re-check (fresh lease should now show `CrowPanel-3851DC`, not `esp32s3-3851DC`) is the user's
+    own next step to fully close this out.
 
 ## 22. Implementation status
 

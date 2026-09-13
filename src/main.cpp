@@ -418,8 +418,21 @@ void startWifiOrPowerOff(const std::string& ssid, const std::string& password) {
 		WiFi.mode(WIFI_OFF);
 		return;
 	}
-	WiFi.mode(WIFI_STA);
+	// setHostname() before mode(WIFI_STA), not after: arduino-esp32's WiFiGenericClass::mode()
+	// only pushes the hostname onto the actual netif/DHCP client at the moment of the STA
+	// transition (WiFiGeneric.cpp, inside mode()'s "m & WIFI_MODE_STA" branch), reading whatever
+	// its own internal default-hostname buffer holds *right then* - setHostname() only writes
+	// that buffer, it doesn't push to the netif itself. Calling mode(WIFI_STA) first meant the
+	// very first STA transition after every boot captured arduino-esp32's own auto-generated
+	// default ("esp32s3-XXYYZZ" from the last 3 MAC bytes, CONFIG_IDF_TARGET-prefixed) instead of
+	// deviceName() - found live: DEVICE_NAME/mDNS correctly showed "CrowPanel-3851DC" everywhere
+	// (both read the buffer fresh, after it was long since corrected), but the router's own DHCP
+	// lease still showed "esp32s3-3851DC" negotiated at connect time, confirmed via a fresh (not
+	// stale) lease. A later WiFi disable/enable within the same boot masked the bug by luck - by
+	// then the buffer already held the right value from this same call, so the next STA
+	// transition picked it up - but the very first connection after any reboot/OTA never did.
 	WiFi.setHostname(deviceName().c_str());
+	WiFi.mode(WIFI_STA);
 	WiFi.begin(ssid.c_str(), password.c_str());
 }
 
