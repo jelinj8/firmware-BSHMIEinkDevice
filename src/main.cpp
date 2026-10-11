@@ -98,7 +98,6 @@ namespace {
 constexpr char kFirmwareVersion[] = "0.1.0-dev (" __DATE__ " " __TIME__ ")";
 
 constexpr uint16_t kTcpPort = 5577;  // doc/PROTOCOL.md §3.2 - no well-known port, this project's choice
-constexpr unsigned long kWifiConnectTimeoutMs = 15000;
 constexpr unsigned long kOtaConfirmTimeoutMs = 5 * 60 * 1000;	// §16.4 auto-rollback safety net
 constexpr uint16_t kBlePreferredMtu = 247;	 // doc/PROTOCOL.md §3.1 - NimBLE-Arduino's usual practical ceiling
 constexpr uint32_t kBleStreamBufSize = 1024;  // NimBLEStreamServer's own default; fine for now, see §3.1
@@ -493,36 +492,47 @@ std::string bleStatusLabel() {
 }
 
 // Starts the TCP server and the mDNS responder the first time WiFi is actually associated - called
-// both from the boot-time blocking connect below and every pollTcp() iteration (loop()-driven,
-// non-blocking), so a live SET_WIFI_CONFIG/SET_WIFI_ENABLED reconnect picks both up automatically
-// without needing its own blocking wait. mDNS advertises the device as "<deviceName()>.local" plus
+// from every pollTcp() iteration (loop()-driven, non-blocking), so both the boot-time connect and a
+// live SET_WIFI_CONFIG/SET_WIFI_ENABLED reconnect pick both up automatically without a blocking
+// wait. mDNS advertises the device as "<deviceName()>.local" plus
 // a "_crowpanel._tcp" service naming this same TCP port, so a PC client can find/resolve the device
 // without needing to already know its IP - reflects whatever deviceName() is at the moment of this
 // specific connection, same as WiFi.setHostname() (startWifiOrPowerOff()) already does; a later
 // SET_DEVICE_NAME doesn't retroactively rename an already-running mDNS responder, only the next
 // reconnect does, which is the existing, established precedent here, not a new limitation.
+// Set once setup() switches the UART to the framed Serial transport - plain-text status output
+// after that would land in the frame stream a Serial-connected PC is reading.
+bool gFramedMode = false;
+
 void startTcpServerIfNeeded() {
 	if (gTcpServer || WiFi.status() != WL_CONNECTED) {
 		return;
 	}
 	gTcpServer.reset(new WiFiServer(kTcpPort));
 	gTcpServer->begin();
-	Serial.printf("TCP: server listening on %s:%u\n", WiFi.localIP().toString().c_str(), kTcpPort);
+	if (!gFramedMode) {
+		Serial.printf("TCP: server listening on %s:%u\n", WiFi.localIP().toString().c_str(), kTcpPort);
+	}
 
-	if (MDNS.begin(deviceName().c_str())) {
+	bool mdnsOk = MDNS.begin(deviceName().c_str());
+	if (mdnsOk) {
 		MDNS.addService("crowpanel", "tcp", kTcpPort);
-		Serial.printf("mDNS: responding as \"%s.local\"\n", deviceName().c_str());
-	} else {
-		Serial.println("mDNS: MDNS.begin() failed - device will only be reachable by IP");
+	}
+	if (!gFramedMode) {
+		if (mdnsOk) {
+			Serial.printf("mDNS: responding as \"%s.local\"\n", deviceName().c_str());
+		} else {
+			Serial.println("mDNS: MDNS.begin() failed - device will only be reachable by IP");
+		}
 	}
 }
 
-// Connects to WiFi (STA mode) and, on success, starts the TCP server. Prints progress/result to
-// Serial - still within the plain-text boot window, before the framed-protocol cutover. Failure
-// (no credentials, wrong password, AP out of range, timeout, or WiFi explicitly disabled via
-// SET_WIFI_ENABLED) is not fatal: it just leaves TCP unavailable for this session, Serial still
-// works regardless. Only used for the initial boot-time attempt - a live reconnect triggered by
-// SET_WIFI_CONFIG/SET_WIFI_ENABLED must never block loop() like this does, see those handlers.
+// Starts connecting to WiFi (STA mode) at boot, without waiting: the TCP server starts once WiFi
+// associates, from pollTcp()'s startTcpServerIfNeeded() - the same path a live reconnect
+// (SET_WIFI_CONFIG/SET_WIFI_ENABLED) uses. It used to wait here up to 15s, which held up BLE, the
+// framed transports and the init macro (boot info screen to cleaning flash) on every boot whose
+// configured network wasn't in range. A connection that never comes just leaves TCP unavailable;
+// Serial and BLE work regardless.
 void connectWifiAndStartTcpServer() {
 	// No longer an unconditional WiFi.mode(WIFI_STA) here first (design note 102's own earlier
 	// fix): that call's original stated purpose - "initializes the WiFi driver so the MAC
@@ -557,24 +567,9 @@ void connectWifiAndStartTcpServer() {
 		return;
 	}
 
-	Serial.printf("WiFi: connecting to \"%s\" as \"%s\"", ssid.c_str(), deviceName().c_str());
+	Serial.printf("WiFi: connecting to \"%s\" as \"%s\" in the background - TCP starts once connected\n",
+			ssid.c_str(), deviceName().c_str());
 	startWifiOrPowerOff(ssid, password);
-
-	unsigned long start = millis();
-	while (WiFi.status() != WL_CONNECTED && millis() - start < kWifiConnectTimeoutMs) {
-		delay(250);
-		Serial.print(".");
-	}
-
-	if (WiFi.status() != WL_CONNECTED) {
-		Serial.printf("\nWiFi: FAILED to connect within %lu ms (status=%d) - TCP transport "
-					  "unavailable this session\n",
-				kWifiConnectTimeoutMs, static_cast<int>(WiFi.status()));
-		return;
-	}
-
-	Serial.printf("\nWiFi: connected, IP=%s\n", WiFi.localIP().toString().c_str());
-	startTcpServerIfNeeded();
 }
 
 // Brings up the BLE peripheral: one service/characteristic (doc/PROTOCOL.md §19) wrapped as a
@@ -1779,13 +1774,14 @@ void handleReadScreen(const CommandContext& ctx) {
 constexpr size_t kClearArtifactsPayloadSize = 2;
 constexpr uint8_t kDefaultClearArtifactsCycles = 3;
 
-// doc/PROTOCOL.md §9: runs CYCLES full black/white flash cycles directly against the display driver
-// (same technique as displaySelfTest()'s bring-up flash, not through the logical working buffer) to
-// physically discharge residual e-ink particle bias. CYCLES=0 uses a firmware default. FLAGS bit0
-// RESTORE_CONTENT=0 leaves the panel blank and marks the "last physically presented" snapshot
-// (§8 SOURCE=PANEL) blank to match, since the working buffer's own logical content is untouched;
-// =1 re-flips the current working buffer back via the normal flush() path instead, which keeps that
-// snapshot in sync on its own.
+// doc/PROTOCOL.md §9: runs CYCLES full updates with the panel's real full waveform (0x22=0xF7),
+// whose LUT itself flashes black/white - the factory firmware's EPD_Clear() did one such update.
+// Each cycle used to be two of them (fill black, update; fill white, update), twice the time for the
+// same flashing. CYCLES=0 uses a firmware default. FLAGS bit0 RESTORE_CONTENT=0: every update shows
+// white, and the "last physically presented" snapshot (§8 SOURCE=PANEL) is marked blank to match,
+// since the working buffer's own logical content is untouched; =1: the last update shows the working
+// buffer itself (the normal flush() path, which keeps that snapshot in sync) - flashing and
+// restoring in one update instead of a white one plus a separate redraw.
 void handleClearArtifacts(const CommandContext& ctx) {
 	if (board::kPinDisplayCs < 0) {
 		ctx.nack(status::kUnsupportedCommand);
@@ -1807,18 +1803,19 @@ void handleClearArtifacts(const CommandContext& ctx) {
 	// black/white internally in hardware as part of one update. selectFastFullUpdate(false)/(true)
 	// brackets just this cycle loop to borrow that real waveform for a genuine flash, without
 	// affecting any other full update in the firmware (normal drawing, FAST_CLEAR, boot screen).
+	bool restore = flags & clearArtifactsFlags::kRestoreContent;
 	gDisplay.epd2.selectFastFullUpdate(false);
 	for (uint8_t i = 0; i < cycles; i++) {
-		gDisplay.fillScreen(GxEPD_BLACK);
-		gDisplay.display(/*partial_update_mode=*/false);
-		gDisplay.fillScreen(GxEPD_WHITE);
-		gDisplay.display(/*partial_update_mode=*/false);
+		if (restore && i == cycles - 1) {
+			gWorkingBuffer.flush(0, 0, GxEPD2_420_GDEY042T81::WIDTH, GxEPD2_420_GDEY042T81::HEIGHT, /*full=*/true);
+		} else {
+			gDisplay.fillScreen(GxEPD_WHITE);
+			gDisplay.display(/*partial_update_mode=*/false);
+		}
 	}
 	gDisplay.epd2.selectFastFullUpdate(true);
 
-	if (flags & clearArtifactsFlags::kRestoreContent) {
-		gWorkingBuffer.flush(0, 0, GxEPD2_420_GDEY042T81::WIDTH, GxEPD2_420_GDEY042T81::HEIGHT, /*full=*/true);
-	} else {
+	if (!restore) {
 		gWorkingBuffer.markPanelBlank();
 	}
 	ctx.ack();
@@ -3501,20 +3498,21 @@ std::vector<uint8_t> buildDefaultInitMacro() {
 	// erased before the cleaning even started.
 	recorder.record(cmd::kFastClear, { color::kWhite, 0x00 });	// COLOR=WHITE, FLAGS=0 (deferred)
 	recorder.record(cmd::kPause, { 0xE8, 0x03, 0x00, 0x00 });		// DURATION_MS=1000 (u32 LE)
-	// CYCLES=1, not 0/default (kDefaultClearArtifactsCycles=3, i.e. 6 full updates - measured at
+	// CYCLES=1, not 0/default (kDefaultClearArtifactsCycles=3, then 6 full updates - measured at
 	// ~4s each in practice, design note 83's own boot-log timing - noticeably slower than the
-	// 2-full-update self-test this whole sequence replaced). A fresh boot has no real accumulated
+	// 2-full-update self-test this whole sequence replaced; one flashing update per cycle now). A fresh boot has no real accumulated
 	// ghosting to clear yet, unlike CLEAR_ARTIFACTS's general-purpose default aimed at a
 	// long-running device's own history, so one cycle (2 full updates) is plenty here - asked
 	// directly: "the original firmware was us[]ing sort of fast flashing instead of slow
 	// redraws... Now it redraws filled screen several times and the init is even slower than
 	// before." GxEPD2_420_GDEY042T81's own useFastFullUpdate=true is already the default (checked
 	// directly in its header, not assumed) - every full update here already uses the fastest
-	// waveform this panel supports, so cycle count was the only real lever left.
-	// RESTORE_CONTENT=1: redraws the working buffer right after the cleaning flash - anything drawn
-	// during the PAUSE above (see FAST_CLEAR's comment). Commands arriving during the cleaning itself
-	// wait for it (CLEAR_ARTIFACTS blocks loop()) and run afterwards anyway. Costs one fast full
-	// update.
+	// waveform this panel supports, so cycle count was the only real lever left. (CLEAR_ARTIFACTS
+	// itself uses the real, flashing waveform - one update per cycle since, see its handler.)
+	// RESTORE_CONTENT=1: the cleaning update shows the working buffer itself - anything drawn during
+	// the PAUSE above (see FAST_CLEAR's comment). Commands arriving during the cleaning itself wait
+	// for it (CLEAR_ARTIFACTS blocks loop()) and run afterwards anyway. No extra update: the flash and
+	// the redraw are the same single full update.
 	recorder.record(cmd::kClearArtifacts, { 0x01, clearArtifactsFlags::kRestoreContent });  // CYCLES=1
 	return recorder.stop();
 }
@@ -3657,6 +3655,7 @@ void setup() {
 	connectWifiAndStartTcpServer();
 	setupBle();
 	Serial.println("--- entering framed-protocol mode on this UART: no further plain-text output ---");
+	gFramedMode = true;
 
 	// doc/PROTOCOL.md §5.3: every handler below now takes a required access level - kNone (the
 	// default, omitted) for HANDSHAKE_REQUEST only, kUsage for normal display-driving/read

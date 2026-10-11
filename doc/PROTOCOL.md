@@ -530,10 +530,15 @@ than addressing a panel RAM window.
 
 ```
 Offset  Size  Field   Notes
-0       1     CYCLES  Number of full black/white flash cycles to run; 0 = firmware default
-1       1     FLAGS   bit0 RESTORE_CONTENT: 0 = leave panel blank; 1 = re-flip the working
-                       buffer to the panel once cycling finishes. bits1-7 reserved.
+0       1     CYCLES  Number of flashing full updates to run; 0 = firmware default (3)
+1       1     FLAGS   bit0 RESTORE_CONTENT: 0 = leave panel blank; 1 = the last update shows
+                       the working buffer instead of white. bits1-7 reserved.
 ```
+
+Each cycle is one full update with the panel's real full waveform, whose own LUT flashes
+black/white (the same clear the board's factory firmware did) - earlier firmware ran two per cycle
+(black, then white), twice the time for the same effect. With `RESTORE_CONTENT=1` the last cycle's
+update draws the working buffer itself, so cleaning and redrawing take a single update.
 
 Distinct from `CLEAR_REGION` (§12.5), which only fills a working-buffer rectangle and does not
 flash the panel. May take several seconds — PC clients should use a longer ACK timeout for it.
@@ -1723,12 +1728,12 @@ device seeds one itself onto `INTERNAL`, pre-populated with a fixed default: `FA
 `RESTORE_CONTENT=1`) — giving the cold-boot info screen (design note 83) a moment to be read before
 an opinionated but genuinely fast cleanup flash clears it. The deferred `FAST_CLEAR` only clears
 the working buffer (the panel keeps the info screen), so whatever a PC draws during the pause
-stays in the buffer and `RESTORE_CONTENT=1` redraws it right after the flash, instead of the
-drawing being erased or left blank; it costs one fast full update. Commands arriving during the
-flash itself wait for it (`CLEAR_ARTIFACTS` blocks the device's loop) and run afterwards. A device
-seeded by an older firmware keeps its old `/init.macro` - delete it (`FILE_DELETE`
-on `INTERNAL`) to get the current default seeded on the next cold boot. Being a real `.macro`
-file (not a hardcoded routine) means it's just as user-editable/replaceable as `/boot.macro`
+stays in the buffer, and with `RESTORE_CONTENT=1` the cleaning update itself ends up showing it
+instead of a blank panel - flash and redraw in a single update. Commands arriving during the flash
+itself wait for it (`CLEAR_ARTIFACTS` blocks the device's loop) and run afterwards. A device seeded
+by an older firmware keeps its old `/init.macro` - delete it (`FILE_DELETE` on `INTERNAL`) to get
+the current default seeded on the next cold boot. Being a real `.macro` file (not a hardcoded
+routine) means it's just as user-editable/replaceable as `/boot.macro`
 always was - place your own `/init.macro` on SD to override the seeded default entirely, the same
 way any other macro works.
 
@@ -2503,9 +2508,10 @@ if they turn out to matter in practice:
     commands into WiFi. `resolveWifiCredentials()` checks NVS (`kPrefKeyWifiSsid`/`kPrefKeyWifiPass`)
     before falling back to the compile-time `secrets.h` pair, so a device configured over the wire
     keeps using its own credentials across reboots without `secrets.h` ever needing to know. The
-    boot-time connect (`connectWifiAndStartTcpServer()`, still a blocking wait-with-timeout — kept
-    exactly as-is, already verified working, not touched beyond swapping in the resolved credentials)
-    stays separate from the *live* reconnect path (`SET_WIFI_CONFIG` with `FLAGS.CONNECT_NOW`,
+    boot-time connect (`connectWifiAndStartTcpServer()`, originally a blocking wait of up to 15s -
+    later made non-blocking too, as it held up BLE and the init macro on every boot whose network
+    wasn't in range; TCP then starts from `pollTcp()` like a live reconnect) stays separate from the
+    *live* reconnect path (`SET_WIFI_CONFIG` with `FLAGS.CONNECT_NOW`,
     `SET_WIFI_ENABLED(1)`): both just call the inherently non-blocking `WiFi.begin()` and return
     immediately — never re-running the boot-time blocking loop, which would otherwise freeze the
     entire single-threaded firmware for up to `kWifiConnectTimeoutMs` (15s) on every live
