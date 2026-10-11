@@ -1190,9 +1190,19 @@ Offset                    Size          Field         Notes
                                                        power-on default; 0 = this boot only)
                                                        bit1 CONNECT_NOW (attempt to (re)connect
                                                        immediately; 0 = store only)
-                                                       bits2-7 reserved
+                                                       bit2 STATIC_IP (the four fields below
+                                                       follow; 0 = DHCP)
+                                                       bits3-7 reserved
+3+SSID_LEN+PASSWORD_LEN   4             IP            only with STATIC_IP: IPv4, octets A.B.C.D
+7+SSID_LEN+PASSWORD_LEN   4             NETMASK       only with STATIC_IP
+11+SSID_LEN+PASSWORD_LEN  4             GATEWAY       only with STATIC_IP
+15+SSID_LEN+PASSWORD_LEN  4             DNS           only with STATIC_IP (0.0.0.0 = none)
 ```
-`NACK(BAD_PARAMETERS)` if `SSID_LEN=0` or either length exceeds its max. `ACK` means "accepted and
+`NACK(BAD_PARAMETERS)` if `SSID_LEN=0` or either length exceeds its max, or with `STATIC_IP` if
+the payload doesn't carry exactly the four addresses or `IP`/`NETMASK` is `0.0.0.0`. Without
+`STATIC_IP` the device uses DHCP - with `PERSIST` that also clears a previously stored static
+setup, so a client unaware of this bit behaves as before. Like the credentials, the static setup
+applies to `CONNECT_NOW` either way and becomes the power-on default only with `PERSIST`. `ACK` means "accepted and
 stored/applied as requested" — **not** "connected": association can take several seconds, poll
 `WIFI_STATUS_REQUEST` for the actual outcome rather than blocking the ACK on it.
 
@@ -1764,6 +1774,10 @@ instead. Purely opt-in: a missing file is the expected common case, never logged
 formatted as plain decimal (e.g. `/on_button_2_press.macro` for `MENU`). This is a non-issue for
 filesystem name-length limits — these lookups are hardcoded to `VOLUME=PSRAM`, a flat, session-only
 `std::map`-backed volume with no filesystem-imposed name-length cap.
+
+**Device IP variable**: `/device_ip.txt` (`VOLUME=PSRAM`) always holds the device's current WiFi
+IP address as plain text, empty while not connected - rewritten whenever it changes, so any macro
+can show it via `DRAW_TEXT`'s `FLAGS.TEXT_IS_PATH` (§12.6) with `TEXT="R:/device_ip.txt"`.
 
 **Fallback + "last trigger" variable**: a fixed `/on_any_event.macro` is checked on every eligible
 event too, regardless of whether a specific macro above also matches. If it exists,
@@ -2508,10 +2522,10 @@ if they turn out to matter in practice:
     commands into WiFi. `resolveWifiCredentials()` checks NVS (`kPrefKeyWifiSsid`/`kPrefKeyWifiPass`)
     before falling back to the compile-time `secrets.h` pair, so a device configured over the wire
     keeps using its own credentials across reboots without `secrets.h` ever needing to know. The
-    boot-time connect (`connectWifiAndStartTcpServer()`, originally a blocking wait of up to 15s -
-    later made non-blocking too, as it held up BLE and the init macro on every boot whose network
-    wasn't in range; TCP then starts from `pollTcp()` like a live reconnect) stays separate from the
-    *live* reconnect path (`SET_WIFI_CONFIG` with `FLAGS.CONNECT_NOW`,
+    boot-time connect (`connectWifiAndStartTcpServer()`, a blocking wait of up to 15s - briefly made
+    non-blocking, then restored so the boot log shows whether WiFi works; a failed attempt keeps
+    retrying in the background and TCP starts from `pollTcp()` like a live reconnect) stays separate
+    from the *live* reconnect path (`SET_WIFI_CONFIG` with `FLAGS.CONNECT_NOW`,
     `SET_WIFI_ENABLED(1)`): both just call the inherently non-blocking `WiFi.begin()` and return
     immediately — never re-running the boot-time blocking loop, which would otherwise freeze the
     entire single-threaded firmware for up to `kWifiConnectTimeoutMs` (15s) on every live

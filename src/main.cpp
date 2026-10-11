@@ -98,6 +98,7 @@ namespace {
 constexpr char kFirmwareVersion[] = "0.1.0-dev (" __DATE__ " " __TIME__ ")";
 
 constexpr uint16_t kTcpPort = 5577;  // doc/PROTOCOL.md §3.2 - no well-known port, this project's choice
+constexpr unsigned long kWifiConnectTimeoutMs = 15000;
 constexpr unsigned long kOtaConfirmTimeoutMs = 5 * 60 * 1000;	// §16.4 auto-rollback safety net
 constexpr uint16_t kBlePreferredMtu = 247;	 // doc/PROTOCOL.md §3.1 - NimBLE-Arduino's usual practical ceiling
 constexpr uint32_t kBleStreamBufSize = 1024;  // NimBLEStreamServer's own default; fine for now, see §3.1
@@ -376,6 +377,12 @@ constexpr const char* kPrefKeyDeviceName = "devname";
 constexpr const char* kPrefKeyWifiSsid = "wifi_ssid";
 constexpr const char* kPrefKeyWifiPass = "wifi_pass";
 constexpr const char* kPrefKeyWifiEnabled = "wifi_en";
+// SET_WIFI_CONFIG FLAGS.STATIC_IP (doc/PROTOCOL.md §13.2): IPv4 addresses as u32, octets A.B.C.D
+// packed most significant first; wifi_sip = 0 (or absent) means DHCP.
+constexpr const char* kPrefKeyWifiStaticIp = "wifi_sip";
+constexpr const char* kPrefKeyWifiStaticMask = "wifi_smask";
+constexpr const char* kPrefKeyWifiStaticGateway = "wifi_sgw";
+constexpr const char* kPrefKeyWifiStaticDns = "wifi_sdns";
 constexpr const char* kPrefKeyBleEnabled = "ble_en";
 constexpr const char* kPrefKeyBleHasPin = "ble_haspin";
 constexpr const char* kPrefKeyBlePin = "ble_pin";
@@ -440,7 +447,67 @@ void resolveWifiCredentials(std::string& ssid, std::string& password) {
 // credentials actually resolved to something non-empty, leaving the radio stuck in STA mode -
 // associated with nothing, but still fully powered - whenever they didn't (e.g. no credentials
 // configured yet). Consolidating here means there's only one place left that can get this wrong.
-void startWifiOrPowerOff(const std::string& ssid, const std::string& password) {
+// Set once setup() switches the UART to the framed Serial transport - plain-text status output
+// after that would land in the frame stream a Serial-connected PC is reading.
+bool gFramedMode = false;
+
+// Logs WiFi station events to Serial during the plain-text boot window only - silent once
+// gFramedMode is set, as the UART then carries the framed Serial transport. Runs on WiFi's own
+// event task. For diagnosing a boot that doesn't connect: reason codes are wifi_err_reason_t, e.g.
+// 201 NO_AP_FOUND, 202 AUTH_FAIL, 15 4WAY_HANDSHAKE_TIMEOUT (usually a wrong password).
+void logWifiBootEvent(arduino_event_id_t event, arduino_event_info_t info) {
+	if (gFramedMode) {
+		return;
+	}
+	switch (event) {
+	case ARDUINO_EVENT_WIFI_STA_START:
+		Serial.println("\nWiFi: station started");
+		break;
+	case ARDUINO_EVENT_WIFI_STA_STOP:
+		Serial.println("\nWiFi: station stopped");
+		break;
+	case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+		Serial.println("\nWiFi: associated with the access point");
+		break;
+	case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+		Serial.printf("\nWiFi: disconnected, reason=%u\n", static_cast<unsigned>(info.wifi_sta_disconnected.reason));
+		break;
+	case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+		Serial.printf("\nWiFi: got IP %s\n", IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+		break;
+	default:
+		break;
+	}
+}
+
+// SET_WIFI_CONFIG FLAGS.STATIC_IP (doc/PROTOCOL.md §13.2) - a static IPv4 setup instead of DHCP.
+// Addresses as u32, octets A.B.C.D packed most significant first; ip == 0 means DHCP.
+struct WifiIpConfig {
+	uint32_t ip = 0;
+	uint32_t mask = 0;
+	uint32_t gateway = 0;
+	uint32_t dns = 0;
+	bool isStatic() const { return ip != 0; }
+};
+
+IPAddress toIpAddress(uint32_t v) {
+	return IPAddress(static_cast<uint8_t>(v >> 24), static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 8),
+			static_cast<uint8_t>(v));
+}
+
+// The persisted static IP setup, or DHCP - see WifiIpConfig. Like resolveWifiCredentials(), only
+// what was stored with FLAGS.PERSIST: a "this boot only" SET_WIFI_CONFIG applies just to its own
+// CONNECT_NOW attempt.
+WifiIpConfig resolveWifiIpConfig() {
+	WifiIpConfig cfg;
+	cfg.ip = gPrefs.getUInt(kPrefKeyWifiStaticIp, 0);
+	cfg.mask = gPrefs.getUInt(kPrefKeyWifiStaticMask, 0);
+	cfg.gateway = gPrefs.getUInt(kPrefKeyWifiStaticGateway, 0);
+	cfg.dns = gPrefs.getUInt(kPrefKeyWifiStaticDns, 0);
+	return cfg;
+}
+
+void startWifiOrPowerOff(const std::string& ssid, const std::string& password, const WifiIpConfig& ipConfig) {
 	if (ssid.empty()) {
 		WiFi.mode(WIFI_OFF);
 		return;
@@ -459,8 +526,20 @@ void startWifiOrPowerOff(const std::string& ssid, const std::string& password) {
 	// then the buffer already held the right value from this same call, so the next STA
 	// transition picked it up - but the very first connection after any reboot/OTA never did.
 	WiFi.setHostname(deviceName().c_str());
-	WiFi.mode(WIFI_STA);
-	WiFi.begin(ssid.c_str(), password.c_str());
+	bool modeOk = WiFi.mode(WIFI_STA);
+	// After mode(WIFI_STA) (see above), before begin(). All-zero addresses switch an earlier static
+	// setup of this same boot back to DHCP.
+	bool ipOk = ipConfig.isStatic()
+			? WiFi.config(toIpAddress(ipConfig.ip), toIpAddress(ipConfig.gateway), toIpAddress(ipConfig.mask),
+					toIpAddress(ipConfig.dns))
+			: WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+	wl_status_t begun = WiFi.begin(ssid.c_str(), password.c_str());
+	if (!gFramedMode) {
+		Serial.printf("\nWiFi: mode(STA) -> %s, %s -> %s, begin() -> status %d\n", modeOk ? "ok" : "FAILED",
+				ipConfig.isStatic() ? ("static IP " + std::string(toIpAddress(ipConfig.ip).toString().c_str())).c_str()
+									: "DHCP",
+				ipOk ? "ok" : "FAILED", static_cast<int>(begun));
+	}
 }
 
 // doc/PROTOCOL.md §13.2 SET_WIFI_ENABLED FLAGS.PERSIST: defaults to true (radio on) so existing
@@ -491,19 +570,34 @@ std::string bleStatusLabel() {
 	return gPrefs.getBool(kPrefKeyBleEnabled, true) ? "on" : "off";
 }
 
+// "/device_ip.txt" on VOLUME=PSRAM: the current WiFi IP address as plain text, empty while not
+// connected - a "universal variable" (like /trigger_id.txt) a macro can show via DRAW_TEXT's
+// FLAGS.TEXT_IS_PATH, TEXT="R:/device_ip.txt". Rewritten only when the address changes; called
+// from the boot connect and every loop() (pollTcp()), never from WiFi's own event task, so the
+// storage layer is only ever touched from the main loop.
+constexpr const char* kDeviceIpPath = "/device_ip.txt";
+
+void updateDeviceIpVariable() {
+	static std::string lastIp;
+	static bool written = false;
+	std::string ip = WiFi.status() == WL_CONNECTED ? std::string(WiFi.localIP().toString().c_str()) : "";
+	if (written && ip == lastIp) {
+		return;
+	}
+	gStorageManager.upload(volume::kPsram, kDeviceIpPath, reinterpret_cast<const uint8_t*>(ip.data()), ip.size());
+	lastIp = ip;
+	written = true;
+}
+
 // Starts the TCP server and the mDNS responder the first time WiFi is actually associated - called
-// from every pollTcp() iteration (loop()-driven, non-blocking), so both the boot-time connect and a
-// live SET_WIFI_CONFIG/SET_WIFI_ENABLED reconnect pick both up automatically without a blocking
-// wait. mDNS advertises the device as "<deviceName()>.local" plus
+// both from the boot-time connect below and every pollTcp() iteration (loop()-driven,
+// non-blocking), so a background connect after a failed boot attempt and a live
+// SET_WIFI_CONFIG/SET_WIFI_ENABLED reconnect pick both up automatically without a blocking wait. mDNS advertises the device as "<deviceName()>.local" plus
 // a "_crowpanel._tcp" service naming this same TCP port, so a PC client can find/resolve the device
 // without needing to already know its IP - reflects whatever deviceName() is at the moment of this
 // specific connection, same as WiFi.setHostname() (startWifiOrPowerOff()) already does; a later
 // SET_DEVICE_NAME doesn't retroactively rename an already-running mDNS responder, only the next
 // reconnect does, which is the existing, established precedent here, not a new limitation.
-// Set once setup() switches the UART to the framed Serial transport - plain-text status output
-// after that would land in the frame stream a Serial-connected PC is reading.
-bool gFramedMode = false;
-
 void startTcpServerIfNeeded() {
 	if (gTcpServer || WiFi.status() != WL_CONNECTED) {
 		return;
@@ -527,12 +621,13 @@ void startTcpServerIfNeeded() {
 	}
 }
 
-// Starts connecting to WiFi (STA mode) at boot, without waiting: the TCP server starts once WiFi
-// associates, from pollTcp()'s startTcpServerIfNeeded() - the same path a live reconnect
-// (SET_WIFI_CONFIG/SET_WIFI_ENABLED) uses. It used to wait here up to 15s, which held up BLE, the
-// framed transports and the init macro (boot info screen to cleaning flash) on every boot whose
-// configured network wasn't in range. A connection that never comes just leaves TCP unavailable;
-// Serial and BLE work regardless.
+// Connects to WiFi (STA mode) at boot, waiting up to kWifiConnectTimeoutMs, and on success starts
+// the TCP server. Prints progress/result to Serial - still within the plain-text boot window, before
+// the framed-protocol cutover - which is why it waits: the boot log then says whether WiFi works.
+// A failed attempt holds up BLE and the init macro for the whole timeout, but isn't fatal: the radio
+// keeps trying in the background and pollTcp()'s startTcpServerIfNeeded() starts TCP whenever it
+// does connect, the same path a live reconnect (SET_WIFI_CONFIG/SET_WIFI_ENABLED) uses - those must
+// never block loop() like this.
 void connectWifiAndStartTcpServer() {
 	// No longer an unconditional WiFi.mode(WIFI_STA) here first (design note 102's own earlier
 	// fix): that call's original stated purpose - "initializes the WiFi driver so the MAC
@@ -563,13 +658,30 @@ void connectWifiAndStartTcpServer() {
 	if (ssid.empty()) {
 		Serial.println("WiFi: no credentials configured (see firmware/include/secrets.h.example, or "
 						"SET_WIFI_CONFIG) - TCP transport unavailable this session");
-		startWifiOrPowerOff(ssid, password);  // ssid empty - powers the radio off, doesn't connect
+		startWifiOrPowerOff(ssid, password, WifiIpConfig{});  // ssid empty - powers the radio off
 		return;
 	}
 
-	Serial.printf("WiFi: connecting to \"%s\" as \"%s\" in the background - TCP starts once connected\n",
-			ssid.c_str(), deviceName().c_str());
-	startWifiOrPowerOff(ssid, password);
+	Serial.printf("WiFi: connecting to \"%s\" as \"%s\"", ssid.c_str(), deviceName().c_str());
+	WiFi.onEvent(logWifiBootEvent);
+	startWifiOrPowerOff(ssid, password, resolveWifiIpConfig());
+
+	unsigned long start = millis();
+	while (WiFi.status() != WL_CONNECTED && millis() - start < kWifiConnectTimeoutMs) {
+		delay(250);
+		Serial.print(".");
+	}
+
+	if (WiFi.status() != WL_CONNECTED) {
+		Serial.printf("\nWiFi: FAILED to connect within %lu ms (status=%d) - still trying in the "
+					  "background, TCP starts once connected\n",
+				kWifiConnectTimeoutMs, static_cast<int>(WiFi.status()));
+		return;
+	}
+
+	Serial.printf("\nWiFi: connected, IP=%s\n", WiFi.localIP().toString().c_str());
+	startTcpServerIfNeeded();
+	updateDeviceIpVariable();
 }
 
 // Brings up the BLE peripheral: one service/characteristic (doc/PROTOCOL.md §19) wrapped as a
@@ -946,7 +1058,9 @@ constexpr size_t kMaxWifiPasswordLen = 63;
 
 namespace wifiConfigFlags {
 constexpr uint8_t kConnectNow = 1u << 1;
+constexpr uint8_t kStaticIp = 1u << 2;	// IP/NETMASK/GATEWAY/DNS follow FLAGS
 }  // namespace wifiConfigFlags
+constexpr size_t kStaticIpFieldsSize = 16;	// 4x IPv4
 
 void handleSetWifiConfig(const CommandContext& ctx) {
 	const std::vector<uint8_t>& payload = ctx.request.payload;
@@ -960,19 +1074,46 @@ void handleSetWifiConfig(const CommandContext& ctx) {
 		return;
 	}
 	uint8_t passwordLen = payload[1 + ssidLen];
-	if (passwordLen > kMaxWifiPasswordLen || payload.size() != 1u + ssidLen + 1u + passwordLen + 1u) {
+	size_t flagsOffset = 1u + ssidLen + 1u + passwordLen;
+	if (passwordLen > kMaxWifiPasswordLen || payload.size() < flagsOffset + 1u) {
 		ctx.nack(status::kBadParameters);
 		return;
 	}
+	uint8_t flags = payload[flagsOffset];
+	bool staticIp = (flags & wifiConfigFlags::kStaticIp) != 0;
+	if (payload.size() != flagsOffset + 1u + (staticIp ? kStaticIpFieldsSize : 0u)) {
+		ctx.nack(status::kBadParameters);
+		return;
+	}
+	WifiIpConfig ipConfig;
+	if (staticIp) {
+		const uint8_t* p = &payload[flagsOffset + 1];
+		auto readIp = [](const uint8_t* b) {
+			return (static_cast<uint32_t>(b[0]) << 24) | (static_cast<uint32_t>(b[1]) << 16) |
+				   (static_cast<uint32_t>(b[2]) << 8) | b[3];
+		};
+		ipConfig.ip = readIp(p);
+		ipConfig.mask = readIp(p + 4);
+		ipConfig.gateway = readIp(p + 8);
+		ipConfig.dns = readIp(p + 12);
+		if (!ipConfig.isStatic() || ipConfig.mask == 0) {
+			ctx.nack(status::kBadParameters);
+			return;
+		}
+	}
 	std::string ssid(reinterpret_cast<const char*>(&payload[1]), ssidLen);
 	std::string password(reinterpret_cast<const char*>(&payload[2 + ssidLen]), passwordLen);
-	uint8_t flags = payload[2 + ssidLen + passwordLen];
 	bool persist = (flags & configFlags::kPersist) != 0;
 	bool connectNow = (flags & wifiConfigFlags::kConnectNow) != 0;
 
 	if (persist) {
 		gPrefs.putString(kPrefKeyWifiSsid, ssid.c_str());
 		gPrefs.putString(kPrefKeyWifiPass, password.c_str());
+		// Without STATIC_IP this stores all zeros - back to DHCP.
+		gPrefs.putUInt(kPrefKeyWifiStaticIp, ipConfig.ip);
+		gPrefs.putUInt(kPrefKeyWifiStaticMask, ipConfig.mask);
+		gPrefs.putUInt(kPrefKeyWifiStaticGateway, ipConfig.gateway);
+		gPrefs.putUInt(kPrefKeyWifiStaticDns, ipConfig.dns);
 	}
 	// ACK first - association can take several seconds and might disrupt the very connection this
 	// arrived over (§13.2) - poll WIFI_STATUS_REQUEST for the actual outcome, never block the ACK.
@@ -983,7 +1124,7 @@ void handleSetWifiConfig(const CommandContext& ctx) {
 		// connect branch - using it anyway for consistency with every other "start WiFi" call site
 		// (not assuming WiFi.mode(WIFI_STA) is already in effect here, unlike before: this command is
 		// exactly how a device without any credentials yet gets its first ones, live, over the air).
-		startWifiOrPowerOff(ssid, password);  // non-blocking; startTcpServerIfNeeded() picks up success
+		startWifiOrPowerOff(ssid, password, ipConfig);  // non-blocking; startTcpServerIfNeeded() picks up success
 	}
 }
 
@@ -1023,7 +1164,7 @@ void handleSetWifiEnabled(const CommandContext& ctx) {
 	if (enable) {
 		std::string ssid, password;
 		resolveWifiCredentials(ssid, password);
-		startWifiOrPowerOff(ssid, password);  // powers back off instead if no credentials resolve
+		startWifiOrPowerOff(ssid, password, resolveWifiIpConfig());  // powers back off if no credentials resolve
 	} else {
 		stopTcpServerAndClient();
 		WiFi.disconnect(/*wifioff=*/true);
@@ -1302,7 +1443,8 @@ void handleSetPowerMode(const CommandContext& ctx) {
 	if (wifiEnabledSetting()) {
 		std::string ssid, password;
 		resolveWifiCredentials(ssid, password);
-		startWifiOrPowerOff(ssid, password);  // see design note 74; powers back off if no credentials resolve
+		// see design note 74; powers back off if no credentials resolve
+		startWifiOrPowerOff(ssid, password, resolveWifiIpConfig());
 	}
 	if (!keepBleConnectable && gBleEnabled) {
 		NimBLEDevice::startAdvertising();
@@ -3566,6 +3708,7 @@ void tryPlayInitMacro() {
 // is rejected outright rather than queued.
 void pollTcp() {
 	startTcpServerIfNeeded();  // picks up a live SET_WIFI_CONFIG/SET_WIFI_ENABLED reconnect
+	updateDeviceIpVariable();
 	if (!gTcpServer) {
 		return;
 	}
