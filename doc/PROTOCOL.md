@@ -594,11 +594,6 @@ entries, `"boot_done"` at the very end of the combined sequence (after `/boot.ma
 any) — so a PC can reliably learn when each stage of the cold-boot sequence has actually finished
 without needing to embed its own markers for this common case.
 
-The device also sends `"ble_tx_fail rc=<code> n=<count>"` on its own when BLE notifications failed
-for a reason other than the stack being momentarily out of buffers (`rc` is the last NimBLE return
-code, `n` the failures since the previous report) - a diagnostic; the UART carries the framed
-Serial transport, so the firmware never reports this as plain text.
-
 ## 11. Button event (`0x0200`, device → PC, via notify)
 
 ```

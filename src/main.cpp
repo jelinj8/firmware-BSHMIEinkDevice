@@ -53,7 +53,6 @@
 #include <mbedtls/sha256.h>
 #include <gdey/GxEPD2_420_GDEY042T81.h>
 #include <algorithm>
-#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
@@ -197,26 +196,6 @@ uint8_t gSerialAuthLevel = authLevel::kNone;
 // (doc/PROTOCOL.md §19) isn't wired up yet, so this callback otherwise has nothing else to do.
 // onConnect (doc/PROTOCOL.md §5.3, new) relocks gBleAuthLevel for the fresh connection - this
 // class previously had no onConnect override at all.
-// Counts notifications the stack failed to send for any reason but BLE_HS_ENOMEM (6) - the stack
-// being momentarily out of buffers under load, which NimBLEStreamServer retries by itself. Any
-// other code leaves the rest of the stream's TX buffer unsent until the next write. NimBLEStream
-// forwards each notification's status to these user callbacks (ChrCallbacks::onStatus), on
-// NimBLE's own host task - so this only records it; loop() reports it as a LOG_MESSAGE
-// (reportBleTxFailures()). Never Serial.print here: the UART carries the framed Serial transport,
-// and text from this task could land in the middle of a frame loop() is sending.
-std::atomic<int> gBleTxFailRc{0};
-std::atomic<uint32_t> gBleTxFailCount{0};
-
-class BleTxStatusLogger : public NimBLECharacteristicCallbacks {
-	void onStatus(NimBLECharacteristic* /*chr*/, NimBLEConnInfo& /*connInfo*/, int code) override {
-		if (code != 0 && code != BLE_HS_ENOMEM) {
-			gBleTxFailRc = code;
-			gBleTxFailCount++;
-		}
-	}
-};
-BleTxStatusLogger gBleTxStatusLogger;
-
 // StreamFrameTransport::send()'s action on a full BLE TX buffer: just give NimBLE's own host task
 // time to send it. Not flush(): NimBLEStreamServer::flush() drops the whole TX (and RX) buffer
 // when it can't make progress within the stream's timeout (0 unless set) - confirmed on the device
@@ -230,13 +209,16 @@ void waitForBleTx() {
 	kickBleTx();
 }
 
-// Re-schedules NimBLEStreamServer's TX drain while its buffer still holds data. Its send() stops
+// Re-schedules NimBLEStreamServer's TX drain while its buffer still holds data - sends nothing of
+// its own, and does nothing while the buffer is empty. Its send() stops
 // without scheduling a retry when a notification fails and its async status (m_rc) isn't ENOMEM
 // yet - e.g. NimBLECharacteristic::sendValue() returning ENOMEM synchronously (mbuf allocation)
 // with no status callback at all - leaving the rest of a response queued until the next write,
 // i.e. until the PC has already timed out. A zero-length write() only calls drainTx().
 void kickBleTx() {
-	if (gBleStream.availableForWrite() < kBleStreamBufSize) {
+	// ready(): only with a subscribed peer - otherwise there's no one to send to, and re-posting the
+	// drain on every loop() would just burn CPU (and power) until someone connects.
+	if (gBleStream.ready() && gBleStream.availableForWrite() < kBleStreamBufSize) {
 		static const uint8_t kNone = 0;
 		gBleStream.write(&kNone, 0);
 	}
@@ -622,8 +604,6 @@ void setupBle() {
 	bool streamOk = gBleStream.begin(NimBLEUUID(ble::kServiceUuid), NimBLEUUID(ble::kCharacteristicUuid),
 			kBleStreamBufSize, kBleStreamBufSize, /*secure=*/hasPin);
 	Serial.printf("BLE: gBleStream.begin() -> %s\n", streamOk ? "true" : "FALSE");
-	// After begin(), which takes over the characteristic's callbacks - see BleTxStatusLogger.
-	gBleStream.setCallbacks(&gBleTxStatusLogger);
 	gBleTransport.setFlushOnStall(waitForBleTx);
 
 	NimBLEServer* server = NimBLEDevice::getServer();
@@ -3420,21 +3400,6 @@ void pushLogMessage(const std::vector<uint8_t>& payload) {
 	}
 }
 
-// Reports BLE notification failures BleTxStatusLogger counted since the last call, as a
-// "ble_tx_fail rc=<last code> n=<count>" LOG_MESSAGE - called from loop().
-uint32_t gBleTxFailReported = 0;
-
-void reportBleTxFailures() {
-	uint32_t count = gBleTxFailCount;
-	if (count == gBleTxFailReported) {
-		return;
-	}
-	std::string msg = "ble_tx_fail rc=" + std::to_string(gBleTxFailRc.load()) + " n=" +
-			std::to_string(count - gBleTxFailReported);
-	gBleTxFailReported = count;
-	pushLogMessage(std::vector<uint8_t>(msg.begin(), msg.end()));
-}
-
 void handleLogMessage(const CommandContext& ctx) {
 	pushLogMessage(ctx.request.payload);
 	ctx.ack();
@@ -3768,7 +3733,6 @@ void loop() {
 	pollTcp();
 	gBleTransport.poll();
 	kickBleTx();
-	reportBleTxFailures();
 	stepMacroPlayback();
 	gGpioController.update();
 	gButtonController.update();
