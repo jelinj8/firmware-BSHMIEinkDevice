@@ -507,7 +507,12 @@ WifiIpConfig resolveWifiIpConfig() {
 	return cfg;
 }
 
+// Whether the last WiFi start used a static IP setup (WIFI_STATUS_RESPONSE.STATIC_IP) - what's in
+// effect, which a "this boot only" SET_WIFI_CONFIG can make differ from what's stored in NVS.
+bool gWifiStaticIpActive = false;
+
 void startWifiOrPowerOff(const std::string& ssid, const std::string& password, const WifiIpConfig& ipConfig) {
+	gWifiStaticIpActive = !ssid.empty() && ipConfig.isStatic();
 	if (ssid.empty()) {
 		WiFi.mode(WIFI_OFF);
 		return;
@@ -1141,6 +1146,7 @@ void handleWifiStatusRequest(const CommandContext& ctx) {
 	out.push_back(ip[1]);
 	out.push_back(ip[2]);
 	out.push_back(ip[3]);
+	out.push_back(gWifiStaticIpActive ? 1 : 0);  // STATIC_IP
 	ctx.reply(cmd::kWifiStatusResponse, out);
 }
 

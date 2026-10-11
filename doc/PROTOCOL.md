@@ -1215,7 +1215,11 @@ Response: 0            1         ENABLED     radio on/off, independent of associ
           3            SSID_LEN  SSID        UTF-8 - never the password (write-only)
           3+SSID_LEN   4         IP_ADDRESS  4 raw bytes, dotted-quad octets in order A.B.C.D;
                                               all zero if not connected
+          7+SSID_LEN   1         STATIC_IP   1 = the current connection attempt uses a static IP
+                                              setup (SET_WIFI_CONFIG FLAGS.STATIC_IP), 0 = DHCP
 ```
+`STATIC_IP` was appended later: a client must accept a response that ends after `IP_ADDRESS`
+(older firmware) and may ignore anything after the fields it knows.
 
 #### `0x0406` SET_WIFI_ENABLED (PC → device)
 ```
