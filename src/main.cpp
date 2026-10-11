@@ -3494,10 +3494,13 @@ constexpr const char* kInitMacroPath = "/init.macro";
 std::vector<uint8_t> buildDefaultInitMacro() {
 	MacroRecorder recorder;
 	recorder.start();
+	// FAST_CLEAR before the PAUSE: it only clears the working buffer (FLAGS=0, deferred), removing
+	// the boot info screen from it while the panel keeps showing it during the pause. Whatever a PC
+	// draws during the pause then stays in the buffer and CLEAR_ARTIFACTS' RESTORE_CONTENT=1
+	// redraws it after the cleaning flash - with FAST_CLEAR after the pause, such a drawing was
+	// erased before the cleaning even started.
+	recorder.record(cmd::kFastClear, { color::kWhite, 0x00 });	// COLOR=WHITE, FLAGS=0 (deferred)
 	recorder.record(cmd::kPause, { 0xE8, 0x03, 0x00, 0x00 });		// DURATION_MS=1000 (u32 LE)
-	recorder.record(cmd::kFastClear, { color::kWhite, 0x00 });	// COLOR=WHITE, FLAGS=0 (deferred -
-																	// the degauss cycle right after
-																	// overrides the panel anyway)
 	// CYCLES=1, not 0/default (kDefaultClearArtifactsCycles=3, i.e. 6 full updates - measured at
 	// ~4s each in practice, design note 83's own boot-log timing - noticeably slower than the
 	// 2-full-update self-test this whole sequence replaced). A fresh boot has no real accumulated
@@ -3508,9 +3511,10 @@ std::vector<uint8_t> buildDefaultInitMacro() {
 	// before." GxEPD2_420_GDEY042T81's own useFastFullUpdate=true is already the default (checked
 	// directly in its header, not assumed) - every full update here already uses the fastest
 	// waveform this panel supports, so cycle count was the only real lever left.
-	// RESTORE_CONTENT=1: redraws the working buffer right after the cleaning flash, so anything a PC
-	// (or /boot.macro) drew while the boot sequence was still running shows up - with RESTORE_CONTENT=0
-	// the panel stayed blank although the working buffer held the drawing. Costs one fast full update.
+	// RESTORE_CONTENT=1: redraws the working buffer right after the cleaning flash - anything drawn
+	// during the PAUSE above (see FAST_CLEAR's comment). Commands arriving during the cleaning itself
+	// wait for it (CLEAR_ARTIFACTS blocks loop()) and run afterwards anyway. Costs one fast full
+	// update.
 	recorder.record(cmd::kClearArtifacts, { 0x01, clearArtifactsFlags::kRestoreContent });  // CYCLES=1
 	return recorder.stop();
 }

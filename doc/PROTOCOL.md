@@ -1718,13 +1718,15 @@ NACK to at boot anyway). Both are chained into a single `MacroPlayer` run (it on
 playback at a time), so `/init.macro`'s entries always finish before `/boot.macro`'s begin.
 
 `/init.macro` runs on *every* cold boot, not conditionally — if neither volume has one yet, the
-device seeds one itself onto `INTERNAL`, pre-populated with a fixed default: `PAUSE` 1000ms,
-`FAST_CLEAR` (§12.16, `COLOR=WHITE`), `CLEAR_ARTIFACTS` (§9, `CYCLES=1`, `RESTORE_CONTENT=1`) —
-giving the cold-boot info screen (design note 83) a moment to be read before an opinionated but
-genuinely fast cleanup flash clears it. `RESTORE_CONTENT=1` redraws the working buffer right after
-the flash, so whatever a PC drew while the boot sequence was still running is shown rather than
-left only in the buffer (the panel stayed blank with `RESTORE_CONTENT=0`); it costs one fast full
-update. A device seeded by an older firmware keeps its old `/init.macro` - delete it (`FILE_DELETE`
+device seeds one itself onto `INTERNAL`, pre-populated with a fixed default: `FAST_CLEAR`
+(§12.16, `COLOR=WHITE`, deferred), `PAUSE` 1000ms, `CLEAR_ARTIFACTS` (§9, `CYCLES=1`,
+`RESTORE_CONTENT=1`) — giving the cold-boot info screen (design note 83) a moment to be read before
+an opinionated but genuinely fast cleanup flash clears it. The deferred `FAST_CLEAR` only clears
+the working buffer (the panel keeps the info screen), so whatever a PC draws during the pause
+stays in the buffer and `RESTORE_CONTENT=1` redraws it right after the flash, instead of the
+drawing being erased or left blank; it costs one fast full update. Commands arriving during the
+flash itself wait for it (`CLEAR_ARTIFACTS` blocks the device's loop) and run afterwards. A device
+seeded by an older firmware keeps its old `/init.macro` - delete it (`FILE_DELETE`
 on `INTERNAL`) to get the current default seeded on the next cold boot. Being a real `.macro`
 file (not a hardcoded routine) means it's just as user-editable/replaceable as `/boot.macro`
 always was - place your own `/init.macro` on SD to override the seeded default entirely, the same
@@ -3062,8 +3064,8 @@ if they turn out to matter in practice:
 
     `/init.macro` is a real file (same `.macro` format, §18), not a hardcoded routine - the device
     seeds it onto `INTERNAL` with a fixed default the first time neither volume has one:
-    `PAUSE(1000ms)` → `FAST_CLEAR(WHITE)` (§12.16) → `CLEAR_ARTIFACTS(CYCLES=1, RESTORE_CONTENT=1)`
-    (§9; `RESTORE_CONTENT=1` added later, see §18 "Init macro and boot macro"). Reuses
+    `FAST_CLEAR(WHITE)` (§12.16) → `PAUSE(1000ms)` → `CLEAR_ARTIFACTS(CYCLES=1, RESTORE_CONTENT=1)`
+    (§9; reordered and `RESTORE_CONTENT=1` added later, see §18 "Init macro and boot macro"). Reuses
     `MacroRecorder` (a local instance) to build the seed bytes rather than hand-rolling the entry
     layout a second time. Deliberately user-editable/replaceable afterward, same as `/boot.macro`
     always was.
@@ -4341,7 +4343,7 @@ if they turn out to matter in practice:
   traced to the test itself.
 
   **`/init.macro`, chained before `/boot.macro` on every cold boot, is done** (design note 85):
-  seeds a fixed default (`PAUSE` 1s → `FAST_CLEAR` → `CLEAR_ARTIFACTS`) onto `INTERNAL` the first
+  seeds a fixed default (`FAST_CLEAR` → `PAUSE` 1s → `CLEAR_ARTIFACTS`) onto `INTERNAL` the first
   time neither volume has one - a real, user-replaceable `.macro` file, not a hardcoded routine.
   `kFirmwareVersion` now also carries a compile-time build timestamp
   (`"0.1.0-dev (" __DATE__ " " __TIME__ ")"`), since the hand-maintained semver part alone can't
