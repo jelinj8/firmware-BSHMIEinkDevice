@@ -53,6 +53,7 @@
 #include <mbedtls/sha256.h>
 #include <gdey/GxEPD2_420_GDEY042T81.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
@@ -196,6 +197,51 @@ uint8_t gSerialAuthLevel = authLevel::kNone;
 // (doc/PROTOCOL.md §19) isn't wired up yet, so this callback otherwise has nothing else to do.
 // onConnect (doc/PROTOCOL.md §5.3, new) relocks gBleAuthLevel for the fresh connection - this
 // class previously had no onConnect override at all.
+// Counts notifications the stack failed to send for any reason but BLE_HS_ENOMEM (6) - the stack
+// being momentarily out of buffers under load, which NimBLEStreamServer retries by itself. Any
+// other code leaves the rest of the stream's TX buffer unsent until the next write. NimBLEStream
+// forwards each notification's status to these user callbacks (ChrCallbacks::onStatus), on
+// NimBLE's own host task - so this only records it; loop() reports it as a LOG_MESSAGE
+// (reportBleTxFailures()). Never Serial.print here: the UART carries the framed Serial transport,
+// and text from this task could land in the middle of a frame loop() is sending.
+std::atomic<int> gBleTxFailRc{0};
+std::atomic<uint32_t> gBleTxFailCount{0};
+
+class BleTxStatusLogger : public NimBLECharacteristicCallbacks {
+	void onStatus(NimBLECharacteristic* /*chr*/, NimBLEConnInfo& /*connInfo*/, int code) override {
+		if (code != 0 && code != BLE_HS_ENOMEM) {
+			gBleTxFailRc = code;
+			gBleTxFailCount++;
+		}
+	}
+};
+BleTxStatusLogger gBleTxStatusLogger;
+
+// StreamFrameTransport::send()'s action on a full BLE TX buffer: just give NimBLE's own host task
+// time to send it. Not flush(): NimBLEStreamServer::flush() drops the whole TX (and RX) buffer
+// when it can't make progress within the stream's timeout (0 unless set) - confirmed on the device
+// (serial log: "queued 1024 -> 0 bytes in 1 ms", next to rc=6 notification failures), it cut every
+// response over the 1 KB buffer (large SCREEN_DATA) whenever the stack was busy. send()'s own
+// stall watchdog still gives up on a peer that's gone.
+void kickBleTx();
+
+void waitForBleTx() {
+	delay(2);
+	kickBleTx();
+}
+
+// Re-schedules NimBLEStreamServer's TX drain while its buffer still holds data. Its send() stops
+// without scheduling a retry when a notification fails and its async status (m_rc) isn't ENOMEM
+// yet - e.g. NimBLECharacteristic::sendValue() returning ENOMEM synchronously (mbuf allocation)
+// with no status callback at all - leaving the rest of a response queued until the next write,
+// i.e. until the PC has already timed out. A zero-length write() only calls drainTx().
+void kickBleTx() {
+	if (gBleStream.availableForWrite() < kBleStreamBufSize) {
+		static const uint8_t kNone = 0;
+		gBleStream.write(&kNone, 0);
+	}
+}
+
 class BleServerCallbacks : public NimBLEServerCallbacks {
 	void onConnect(NimBLEServer* /*server*/, NimBLEConnInfo& /*connInfo*/) override {
 		gBleAuthLevel = authLevel::kNone;
@@ -576,6 +622,9 @@ void setupBle() {
 	bool streamOk = gBleStream.begin(NimBLEUUID(ble::kServiceUuid), NimBLEUUID(ble::kCharacteristicUuid),
 			kBleStreamBufSize, kBleStreamBufSize, /*secure=*/hasPin);
 	Serial.printf("BLE: gBleStream.begin() -> %s\n", streamOk ? "true" : "FALSE");
+	// After begin(), which takes over the characteristic's callbacks - see BleTxStatusLogger.
+	gBleStream.setCallbacks(&gBleTxStatusLogger);
+	gBleTransport.setFlushOnStall(waitForBleTx);
 
 	NimBLEServer* server = NimBLEDevice::getServer();
 	server->setCallbacks(&gBleServerCallbacks, /*deleteCallbacks=*/false);  // we own gBleServerCallbacks
@@ -3371,6 +3420,21 @@ void pushLogMessage(const std::vector<uint8_t>& payload) {
 	}
 }
 
+// Reports BLE notification failures BleTxStatusLogger counted since the last call, as a
+// "ble_tx_fail rc=<last code> n=<count>" LOG_MESSAGE - called from loop().
+uint32_t gBleTxFailReported = 0;
+
+void reportBleTxFailures() {
+	uint32_t count = gBleTxFailCount;
+	if (count == gBleTxFailReported) {
+		return;
+	}
+	std::string msg = "ble_tx_fail rc=" + std::to_string(gBleTxFailRc.load()) + " n=" +
+			std::to_string(count - gBleTxFailReported);
+	gBleTxFailReported = count;
+	pushLogMessage(std::vector<uint8_t>(msg.begin(), msg.end()));
+}
+
 void handleLogMessage(const CommandContext& ctx) {
 	pushLogMessage(ctx.request.payload);
 	ctx.ack();
@@ -3479,7 +3543,10 @@ std::vector<uint8_t> buildDefaultInitMacro() {
 	// before." GxEPD2_420_GDEY042T81's own useFastFullUpdate=true is already the default (checked
 	// directly in its header, not assumed) - every full update here already uses the fastest
 	// waveform this panel supports, so cycle count was the only real lever left.
-	recorder.record(cmd::kClearArtifacts, { 0x01, 0x00 });  // CYCLES=1, FLAGS=0 (RESTORE_CONTENT=0, leave blank)
+	// RESTORE_CONTENT=1: redraws the working buffer right after the cleaning flash, so anything a PC
+	// (or /boot.macro) drew while the boot sequence was still running shows up - with RESTORE_CONTENT=0
+	// the panel stayed blank although the working buffer held the drawing. Costs one fast full update.
+	recorder.record(cmd::kClearArtifacts, { 0x01, clearArtifactsFlags::kRestoreContent });  // CYCLES=1
 	return recorder.stop();
 }
 
@@ -3700,6 +3767,8 @@ void loop() {
 	gSerialTransport.poll();
 	pollTcp();
 	gBleTransport.poll();
+	kickBleTx();
+	reportBleTxFailures();
 	stepMacroPlayback();
 	gGpioController.update();
 	gButtonController.update();

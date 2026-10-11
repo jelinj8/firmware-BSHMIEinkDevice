@@ -27,6 +27,10 @@ public:
 
 	void setHandler(FrameHandler handler) { handler_ = std::move(handler); }
 
+	// Replaces send()'s stream_.flush() on a full stream buffer - for a stream whose flush() can
+	// discard data instead of waiting (NimBLEStreamServer, see main.cpp's waitForBleTx()).
+	void setFlushOnStall(std::function<void()> flushOnStall) { flushOnStall_ = std::move(flushOnStall); }
+
 	// Non-blocking: reads whatever bytes are currently available and dispatches every complete
 	// frame found. Call this frequently from loop().
 	void poll() {
@@ -55,7 +59,12 @@ public:
 				break;
 			}
 			if (written == 0) {
-				stream_.flush();  // nudge a full TX buffer to drain before retrying
+				// nudge a full TX buffer to drain before retrying
+				if (flushOnStall_) {
+					flushOnStall_();
+				} else {
+					stream_.flush();
+				}
 				if (millis() > deadline) {
 					break;  // no progress for too long - peer likely gone; drop the rest
 				}
@@ -71,6 +80,7 @@ private:
 
 	Stream& stream_;
 	FrameHandler handler_;
+	std::function<void()> flushOnStall_;
 	std::vector<uint8_t> buffer_;
 
 	// Attempts to parse+dispatch one frame from the front of buffer_. Returns true if it did

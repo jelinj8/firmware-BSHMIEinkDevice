@@ -594,6 +594,11 @@ entries, `"boot_done"` at the very end of the combined sequence (after `/boot.ma
 any) — so a PC can reliably learn when each stage of the cold-boot sequence has actually finished
 without needing to embed its own markers for this common case.
 
+The device also sends `"ble_tx_fail rc=<code> n=<count>"` on its own when BLE notifications failed
+for a reason other than the stack being momentarily out of buffers (`rc` is the last NimBLE return
+code, `n` the failures since the previous report) - a diagnostic; the UART carries the framed
+Serial transport, so the firmware never reports this as plain text.
+
 ## 11. Button event (`0x0200`, device → PC, via notify)
 
 ```
@@ -1719,11 +1724,16 @@ playback at a time), so `/init.macro`'s entries always finish before `/boot.macr
 
 `/init.macro` runs on *every* cold boot, not conditionally — if neither volume has one yet, the
 device seeds one itself onto `INTERNAL`, pre-populated with a fixed default: `PAUSE` 1000ms,
-`FAST_CLEAR` (§12.16, `COLOR=WHITE`), `CLEAR_ARTIFACTS` (§9, `CYCLES=1`) — giving the cold-boot
-info screen (design note 83) a moment to be read before an opinionated but genuinely fast cleanup
-flash clears it. Being a real `.macro` file (not a hardcoded routine) means it's just as
-user-editable/replaceable as `/boot.macro` always was - place your own `/init.macro` on SD to
-override the seeded default entirely, the same way any other macro works.
+`FAST_CLEAR` (§12.16, `COLOR=WHITE`), `CLEAR_ARTIFACTS` (§9, `CYCLES=1`, `RESTORE_CONTENT=1`) —
+giving the cold-boot info screen (design note 83) a moment to be read before an opinionated but
+genuinely fast cleanup flash clears it. `RESTORE_CONTENT=1` redraws the working buffer right after
+the flash, so whatever a PC drew while the boot sequence was still running is shown rather than
+left only in the buffer (the panel stayed blank with `RESTORE_CONTENT=0`); it costs one fast full
+update. A device seeded by an older firmware keeps its old `/init.macro` - delete it (`FILE_DELETE`
+on `INTERNAL`) to get the current default seeded on the next cold boot. Being a real `.macro`
+file (not a hardcoded routine) means it's just as user-editable/replaceable as `/boot.macro`
+always was - place your own `/init.macro` on SD to override the seeded default entirely, the same
+way any other macro works.
 
 Two `LOG_MESSAGE` (§10.1) markers are appended directly as macro entries around this sequence,
 design note 86: `"init_done"` right after `/init.macro`'s own entries (whether seeded or
@@ -3057,7 +3067,8 @@ if they turn out to matter in practice:
 
     `/init.macro` is a real file (same `.macro` format, §18), not a hardcoded routine - the device
     seeds it onto `INTERNAL` with a fixed default the first time neither volume has one:
-    `PAUSE(1000ms)` → `FAST_CLEAR(WHITE)` (§12.16) → `CLEAR_ARTIFACTS(CYCLES=1)` (§9). Reuses
+    `PAUSE(1000ms)` → `FAST_CLEAR(WHITE)` (§12.16) → `CLEAR_ARTIFACTS(CYCLES=1, RESTORE_CONTENT=1)`
+    (§9; `RESTORE_CONTENT=1` added later, see §18 "Init macro and boot macro"). Reuses
     `MacroRecorder` (a local instance) to build the seed bytes rather than hand-rolling the entry
     layout a second time. Deliberately user-editable/replaceable afterward, same as `/boot.macro`
     always was.
